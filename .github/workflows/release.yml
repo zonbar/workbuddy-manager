@@ -343,6 +343,25 @@ jobs:
           echo "--- 发布说明预览 ---"
           head -26 RELEASE_NOTES.md
 
+      # 草稿 Release 不会创建 git tag；安装器作业要 checkout 这个 tag，
+      # 所以首次发版时必须先把 tag 指到刚构建的那份提交上。
+      - name: 确保 tag 存在
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          if curl -fsS -o /dev/null -H "Authorization: Bearer $GH_TOKEN" \
+             "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/$TAG"; then
+            echo "tag $TAG 已存在"
+          else
+            SHA="$(git rev-parse HEAD)"
+            echo "创建 tag $TAG -> $SHA"
+            curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"ref\":\"refs/tags/$TAG\",\"sha\":\"$SHA\"}" \
+              "https://api.github.com/repos/${{ github.repository }}/git/refs"
+          fi
+
       - name: 创建 Release 并上传产物
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
