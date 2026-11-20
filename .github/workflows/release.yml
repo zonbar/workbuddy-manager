@@ -639,12 +639,12 @@ jobs:
 
   # ── Apple Silicon 原生封装（DMG）────────────────────────────────
   # 与 Windows 安装器同理：主体 Release 由 release 作业建好，这里补一个
-  # arm64 DMG。macos-14 runner 本身就是 Apple Silicon，go build 能直接
+  # arm64 DMG。macOS runner 本身就是 Apple Silicon，go build 能直接
   # 编出 darwin/arm64 的上游网关；DMG 用 ad-hoc 签名，未做公证。
   macos:
     needs: release
     if: needs.release.outputs.tag != ''
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
