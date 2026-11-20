@@ -24,8 +24,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要构建的 tag（如 v1.0.0）'
+        description: '要构建的 tag（如 v1.0.0）；tag 不存在时会自动创建'
         required: true
+        type: string
+      ref:
+        description: '构建来源分支/提交；留空则已有 tag 用 tag，否则用默认分支'
+        required: false
         type: string
 
 permissions:
@@ -43,18 +47,34 @@ jobs:
     steps:
       - name: 解析版本号
         id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
+          SRC="${{ inputs.ref }}"
+          if [ -z "$SRC" ]; then
+            # 手动补跑时 tag 可能还没建（首次发版就是这样）：此时从默认分支构建，
+            # 后面 gh release create 会把这个 tag 指向同一份代码。
+            if [ "${{ github.event_name }}" = "push" ] \
+               || curl -fsS -o /dev/null -H "Authorization: Bearer $GH_TOKEN" \
+                    "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/$TAG"; then
+              SRC="$TAG"
+            else
+              SRC="${{ github.event.repository.default_branch }}"
+            fi
+          fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "ref=$SRC" >> $GITHUB_OUTPUT
+          echo "构建来源：$SRC -> tag $TAG"
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ steps.vars.outputs.tag }}
+          ref: ${{ steps.vars.outputs.ref }}
           fetch-depth: 0
 
       - name: 安装 Node
@@ -142,7 +162,9 @@ jobs:
           #   · 升级：update.py 把它同步进上游目录（保留 config/auths/data）
           # 上游已由本项目维护，管理端 Release 是唯一更新源：取不到源码或缺少
           # `.upstream-id` 时必须让发布失败，不能发出一个用户无法更新上游的包。
-          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/${{ github.repository }}/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
+          # 载体 Release 固定在项目源仓库；fork 里 github.repository 指向 fork 自身，
+          # 取不到资产会让所有 release 卡在打包阶段。
+          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
           mkdir -p "$STAGE/upstream"
           if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
                  "$UPSTREAM_SRC_URL" -o /tmp/upstream-src.tar.gz \
@@ -345,6 +367,7 @@ jobs:
             # 的版本，不会出现「点了更新却拿到半成品」。
             gh release create "$TAG" \
               --draft \
+              --target "${{ steps.vars.outputs.ref }}" \
               --title "$TAG" \
               --notes-file RELEASE_NOTES.md \
               "${STAGE}.tar.gz" "${STAGE}.zip"
