@@ -636,3 +636,114 @@ jobs:
             windows/launcher/dist/WorkBuddyManagerSetup.exe \
             windows/launcher/dist/WorkBuddyManagerSetup.exe.sha256
           echo "已上传 Windows 安装器（含 .sha256）"
+
+  # ── Apple Silicon 原生封装（DMG）────────────────────────────────
+  # 与 Windows 安装器同理：主体 Release 由 release 作业建好，这里补一个
+  # arm64 DMG。macos-14 runner 本身就是 Apple Silicon，go build 能直接
+  # 编出 darwin/arm64 的上游网关；DMG 用 ad-hoc 签名，未做公证。
+  macos:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 安装 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端静态导出
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:export
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+
+      - name: 取上游源码与 Python 运行时
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release download upstream-src --repo ithtelab/workbuddy-manager \
+            --pattern 'workbuddy2api-src.tar.gz' --dir "$RUNNER_TEMP"
+          mkdir -p upstream
+          tar -xzf "$RUNNER_TEMP/workbuddy2api-src.tar.gz" -C upstream --strip-components=1
+          test -d upstream/cmd/server
+
+          # 可再定位的 CPython 3.11，build-dmg.sh 会整份复制进 .app
+          gh release download 20261110 --repo astral-sh/python-build-standalone \
+            --pattern 'cpython-3.11.18+20261110-aarch64-apple-darwin-install_only.tar.gz' \
+            --dir "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/python"
+          tar -xzf "$RUNNER_TEMP/cpython-3.11.18+20261110-aarch64-apple-darwin-install_only.tar.gz" \
+            -C "$RUNNER_TEMP/python" --strip-components=1
+          test -x "$RUNNER_TEMP/python/bin/python3.11"
+
+      - name: 安装 Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: 构建 Apple Silicon DMG
+        run: |
+          set -eu
+          TAG="${{ needs.release.outputs.tag }}"
+          VERSION="${TAG#v}"
+          ./packaging/macos/build-dmg.sh \
+            --upstream upstream \
+            --python "$RUNNER_TEMP/python" \
+            --version "$VERSION" \
+            --out dist
+          DMG="dist/WorkBuddyManager-$VERSION-macOS-arm64.dmg"
+          test -f "$DMG"
+          shasum -a 256 "$DMG" | cut -d' ' -f1 > SHA256.txt
+
+      - name: 挂到 Release 上（不覆盖已有资产）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ needs.release.outputs.tag }}"
+          VERSION="${TAG#v}"
+          DMG="WorkBuddyManager-$VERSION-macOS-arm64.dmg"
+          if gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "$DMG"; then
+            echo "Release $TAG 上已有 $DMG —— 跳过上传（不覆盖已公布摘要的产物）"
+            exit 0
+          fi
+          gh release upload "$TAG" "dist/$DMG" SHA256.txt
+          echo "已上传 Apple Silicon DMG（含 SHA256.txt）"
+
+      - name: 补充发布说明
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ needs.release.outputs.tag }}"
+          VERSION="${TAG#v}"
+          HASH="$(cat SHA256.txt)"
+          gh release view "$TAG" --json body -q .body > RELEASE_NOTES_MAC.md
+          if grep -q '## macOS 版（Apple Silicon）' RELEASE_NOTES_MAC.md; then
+            echo "发布说明里已有 macOS 段，跳过"
+            exit 0
+          fi
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## macOS 版（Apple Silicon）"
+            echo ""
+            echo "- 原生封装版：\`WorkBuddyManager-$VERSION-macOS-arm64.dmg\`，不需要自己装 Python / Node / Go / Docker。"
+            echo "- 校验：\`SHA256.txt\` 里是这个 DMG 的 SHA256：\`$HASH\`；其他资产的摘要见上面的「产物校验」。"
+            echo "- 仅适用于 Apple Silicon（M1/M2/M3/M4）；ad-hoc 签名，首次打开请右键点击图标 → 打开。"
+          } >> RELEASE_NOTES_MAC.md
+          gh release edit "$TAG" --notes-file RELEASE_NOTES_MAC.md
