@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Gift,
   Zap,
@@ -20,6 +20,8 @@ import {
   ChevronRight,
   Search,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
   RotateCcw,
   Snowflake,
   Sparkles,
@@ -47,6 +49,9 @@ import {
   availabilityGroupLabelKey,
   availabilityLabelKey,
   availabilityOf,
+  isAccountBanned,
+  needsRelogin,
+  disabledReasonText,
   isDegraded,
   mergePoolStatus,
   rateLimitedModels,
@@ -58,6 +63,7 @@ import {
   selectAccounts,
   type GroupFilter,
   type SortKey,
+  type SortDirection,
 } from '@/lib/account-list';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
@@ -73,6 +79,7 @@ import {AccountWeightDialog} from '@/components/common/accounts/AccountWeightDia
 import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
 import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
+import {AccountModelLimitsDialog} from '@/components/common/accounts/AccountModelLimitsDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {ReloginQueueDialog} from '@/components/common/accounts/ReloginQueue';
 import {ModelProbeDialog} from '@/components/common/accounts/ModelProbeDialog';
@@ -117,6 +124,23 @@ const PAGE_SIZE = 20;
  */
 const groupOf = (a: Account) => availabilityGroup(availabilityOf(a));
 
+/**
+ * 把 `dragged` 挪到 `target` 的前面或后面，返回新数组。
+ *
+ * 用 `filter` 先摘掉被拖的那个，再按目标位置插回去 —— 不能靠 `indexOf` 摘除：
+ * 被拖的账号可能还不在顺序里（刚加的号、从没排过序的分组），`indexOf` 返回 -1
+ * 而 `splice(-1, 1)` 会删掉最后一项，用户会看到"拖一下少了一个号"。
+ */
+function moveWithin(
+  order: readonly string[], dragged: string, target: string, after: boolean,
+): string[] {
+  const rest = order.filter((uid) => uid !== dragged);
+  const at = rest.indexOf(target);
+  if (at < 0) return [...order];
+  rest.splice(after ? at + 1 : at, 0, dragged);
+  return rest;
+}
+
 export default function AccountsPage() {
   const {realm, label: realmName} = useRealm();
   const t = useT();
@@ -131,6 +155,7 @@ export default function AccountsPage() {
   // 权重写上游账号文件，混在一起容易让人以为「改了不用重启」。
   const [weightTarget, setWeightTarget] = useState<Account | null>(null);
   const [coolingTarget, setCoolingTarget] = useState<Account | null>(null);
+  const [modelLimitTarget, setModelLimitTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
   /** 账号 × 模型主动探测（issue #270） */
@@ -147,6 +172,17 @@ export default function AccountsPage() {
   const [q, setQ] = useState('');
   const [statusGroup, setStatusGroup] = useState<GroupFilter>('all');
   const [sort, setSort] = useState<SortKey>('default');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  /**
+   * 自定义顺序（拖拽排序）：uid 数组，存在**服务端**（server/services/accountorder.py）。
+   *
+   * 为什么不做浏览器本地存储：顺序是这份部署的共享视图 —— 同一个面板可能有多人
+   * 使用、也可能换设备打开，本地存会让每个人看到不同的顺序。它只影响展示顺序，
+   * 不影响上游选号。
+   */
+  const [manualOrder, setManualOrder] = useState<string[]>([]);
+  /** 正在被拖动的账号 uid；null = 没在拖（行上据此出高亮） */
+  const [draggingUid, setDraggingUid] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   /**
    * 账号分组（多账号池）：一个分组 = 一套上游实例（账号池）。
@@ -308,6 +344,30 @@ export default function AccountsPage() {
     }
   }, [groupId]);
 
+  /** 只刷新单个账号的积分（issue #432）：账号多时不必把整池都打一遍上游 */
+  const refreshOneCredits = useCallback(async (file: string) => {
+    setCreditsBusy(true);
+    try {
+      const r = await accountApi.refreshCredits(true, groupId, file);
+      const num = Object.fromEntries(
+        Object.entries(r.credits).filter(([, v]) => typeof v === 'number') as [string, number][],
+      );
+      setLiveCredits((prev) => ({...prev, ...num}));
+      setCreditsMeta((prev) => ({...prev, ...(r.meta ?? {})}));
+      if (r.failed.length === 0) {
+        notify.ok(t('accounts.creditsRefreshed'), t('accounts.creditsRefreshedDetail',
+          {ok: r.succeeded, total: r.total}));
+      } else {
+        notify.warn(t('accounts.creditsPartial'), t('accounts.creditsPartialDetail',
+          {ok: r.succeeded, total: r.total}));
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setCreditsBusy(false);
+    }
+  }, [groupId, t]);
+
   /** 一键刷新所有账号的 accessToken（真的续期，末尾只重载一次上游） */
   const [refreshTokensBusy, setRefreshTokensBusy] = useState(false);
   const refreshAllTokens = useCallback(async () => {
@@ -440,11 +500,15 @@ export default function AccountsPage() {
    */
   const filtered = useMemo(
     () =>
-      selectAccounts(visible, {q, group: statusGroup, sort}, {
+      selectAccounts(visible, {q, group: statusGroup, sort, direction: sortDirection}, {
         groupOf,
         creditOf: (a) => liveCredits[a.uid] ?? a.credits ?? null,
+        orderRank: (a) => {
+          const i = manualOrder.indexOf(a.uid);
+          return i < 0 ? null : i;
+        },
       }),
-    [visible, q, statusGroup, sort, liveCredits],
+    [visible, q, statusGroup, sort, sortDirection, liveCredits, manualOrder],
   );
 
   const paged = useMemo(() => paginate(filtered, page, PAGE_SIZE), [filtered, page]);
@@ -457,6 +521,113 @@ export default function AccountsPage() {
    */
   if (paged.page !== page) setPage(paged.page);
 
+  /* ── 拖拽排序 ────────────────────────────────────────────────
+   * 长按「头像 / 昵称」320ms 进入拖动，移动时实时改顺序，松手落库。
+   * 用长按而不是直接拖，是因为这一格同时是文本：直接拖会让每次想选中昵称
+   * 都变成挪行。拖动阈值 8px，超过就当"用户在选字/滚动"直接取消。
+   */
+  const dragPressRef = useRef<{uid: string; x: number; y: number; timer: number | null} | null>(null);
+  const draggingRef = useRef<string | null>(null);
+  const manualOrderRef = useRef<string[]>([]);
+  const visibleRef = useRef<Account[]>([]);
+  const dragStartOrderRef = useRef<string[]>([]);
+
+  useEffect(() => { draggingRef.current = draggingUid; }, [draggingUid]);
+  useEffect(() => { manualOrderRef.current = manualOrder; }, [manualOrder]);
+  useEffect(() => { visibleRef.current = visible; }, [visible]);
+
+  useEffect(() => {
+    let alive = true;
+    accountApi.order(groupId)
+      .then((res) => { if (alive) setManualOrder(res.order ?? []); })
+      // 取不到顺序不该让整页报错：退化成空顺序 = 后端顺序，用户仍能正常操作。
+      .catch(() => { if (alive) setManualOrder([]); });
+    return () => { alive = false; };
+  }, [groupId]);
+
+  const persistOrder = useCallback(async (order: string[]) => {
+    try {
+      const res = await accountApi.saveOrder(order, groupId);
+      setManualOrder(res.order ?? order);
+      notify.ok(t('accounts.orderSaved'));
+    } catch (exc) {
+      notify.err(t('accounts.orderSaveFailed'), errText(exc));
+    }
+  }, [groupId, t]);
+
+  useEffect(() => {
+    function clearPress() {
+      const press = dragPressRef.current;
+      if (press?.timer) clearTimeout(press.timer);
+      dragPressRef.current = null;
+    }
+
+    function onMove(e: PointerEvent) {
+      const press = dragPressRef.current;
+      if (press) {
+        if (Math.abs(e.clientX - press.x) > 8 || Math.abs(e.clientY - press.y) > 8) clearPress();
+        return;
+      }
+      const dragged = draggingRef.current;
+      if (!dragged) return;
+      e.preventDefault();
+
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const target = el?.closest?.('tr[data-uid]') as HTMLElement | null;
+      const overUid = target?.dataset.uid;
+      if (!target || !overUid || overUid === dragged) return;
+
+      const rect = target.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      setManualOrder((prev) => moveWithin(
+        // 第一次拖动时顺序还是空的：以当前可见顺序为底稿，否则没有可插入的位置
+        prev.length ? prev : visibleRef.current.map((a) => a.uid), dragged, overUid, after,
+      ));
+    }
+
+    function onUp() {
+      clearPress();
+      if (!draggingRef.current) return;
+      setDraggingUid(null);
+      void persistOrder(manualOrderRef.current);
+    }
+
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || !draggingRef.current) return;
+      setManualOrder(dragStartOrderRef.current);
+      setDraggingUid(null);
+      dragPressRef.current = null;
+    }
+
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', onUp, true);
+    document.addEventListener('pointercancel', onUp, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointermove', onMove, true);
+      document.removeEventListener('pointerup', onUp, true);
+      document.removeEventListener('pointercancel', onUp, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [persistOrder]);
+
+  function handleDragPointerDown(e: React.PointerEvent, a: Account) {
+    // 顺序是**所有人**看到的，所以只有管理员能改（后端同样设了管理员门槛）
+    if (!isAdmin || e.button !== 0) return;
+    dragPressRef.current = {
+      uid: a.uid,
+      x: e.clientX,
+      y: e.clientY,
+      timer: window.setTimeout(() => {
+        dragPressRef.current = null;
+        dragStartOrderRef.current = manualOrderRef.current;
+        // 别的排序档位下松手会被立刻覆盖回去，所以拖动前先切到自定义顺序
+        setSort('manual');
+        setDraggingUid(a.uid);
+      }, 320),
+    };
+  }
+
   /** 三种「看不到账号」的原因，必须分开说——它们要用户做的事完全不同 */
   const noAccountsAtAll = merged.length === 0;
   const noAccountsInRealm = !noAccountsAtAll && visible.length === 0;
@@ -467,6 +638,7 @@ export default function AccountsPage() {
     setQ('');
     setStatusGroup('all');
     setSort('default');
+    setSortDirection('asc');
     setPage(1);
   }
 
@@ -488,9 +660,9 @@ export default function AccountsPage() {
     [visible],
   );
 
-  /** 封控中（上游自动禁用，需重新登录解封）的账号数 */
+  /** 可尝试重登修复的账号数，不含上游封禁。 */
   const blockedCount = useMemo(
-    () => visible.filter((a) => availabilityOf(a) === 'disabled').length,
+    () => visible.filter(needsRelogin).length,
     [visible],
   );
 
@@ -597,6 +769,24 @@ export default function AccountsPage() {
     }
   }
 
+  /**
+   * 扫码登录成功后的收尾（「添加账户」与「重登」**共用**这一份）。
+   *
+   * 为什么不能只刷一次：落盘之后还有两步收尾 —— 上游热加载收录新凭证、
+   * 系统禁用的账号再走一次 revive。它们都是后台进行的，前端立刻刷新拿到的
+   * 仍是旧快照（账号还标着已停用），于是那一行会一直挂在重登队列里，直到
+   * 30 秒心跳才挪走。补几次延迟刷新，让它在收尾完成后尽快落到界面上。
+   *
+   * 两条路共用一份：以前「重登」会补刷、「添加账户」只刷一次，同一件事在两处
+   * 表现不同 —— 用户看到的就是「重登能清掉、添加账户清不掉」。
+   */
+  function handleLoginSuccess() {
+    reloadAll();
+    [3000, 8000, 15000].forEach((ms) => {
+      window.setTimeout(() => reloadAll(), ms);
+    });
+  }
+
   /** 账号状态徽章（表格与移动端卡片共用）。
    *
    *  分档顺序与文案都取自 `lib/account-status`——首页的健康快照用**同一套**
@@ -608,14 +798,14 @@ export default function AccountsPage() {
     const label = t(availabilityLabelKey(tier, a));
 
     if (tier === 'disabled') {
-      const reason = String(a.disabled_reason || '');
+      const reason = disabledReasonText(a);
       // 悬停提示两行：封禁原因 + （管理员）解禁出路。
       // 为什么用 Tooltip 而不是原生 title：原生提示有 1~2 秒延迟且部分环境
       // 根本不弹（用户实测「移上去没效果」）；Radix Tooltip 悬停即显。
       // 移动端没有 hover，原因在下方卡片里直接铺一行小字（见移动端卡片区）。
       const tipLines = [
         reason ? t('accounts.disabledReason', {reason}) : null,
-        isAdmin ? reloginHint : null,
+        isAccountBanned(a) ? t('accounts.bannedHint') : isAdmin ? reloginHint : null,
       ].filter(Boolean) as string[];
       return (
         <Tooltip>
@@ -647,6 +837,9 @@ export default function AccountsPage() {
           {label}
         </Badge>
       );
+    }
+    if (tier === 'riskPaused') {
+      return <Badge variant="outline" className="rounded-full text-amber-600" title={t('risk.recovery')}>{label}</Badge>;
     }
     if (tier === 'manualDisabled') {
       // 上游状态位停用（issue #45）：同样中性灰，但提示文案不同——这条是
@@ -715,10 +908,10 @@ export default function AccountsPage() {
       return (
         <Badge
           variant="secondary"
-          className="rounded-full text-amber-600 dark:text-amber-400"
+          className="max-w-full flex-wrap justify-start whitespace-normal rounded-full text-left text-amber-600 dark:text-amber-400"
           title={tip || undefined}
         >
-          {label}{left ? ` · ${left}` : ''}
+          <span>{label}{left ? ` · ${left}` : ''}</span>
           {total > 0 && <span className="ml-1 opacity-70">{t('accounts.modelsCount', {count: total, n: total})}</span>}
         </Badge>
       );
@@ -769,51 +962,19 @@ export default function AccountsPage() {
     );
   }
 
-  /** 模型级限流标记（issue #43）。
-   *
-   *  为什么单独做一个徽章、而不是并进状态列：**账号本身是在线的**，只是某个
-   *  模型暂时被腾讯限流（6004）。用户的实际观察是「换个模型就能继续用」，
-   *  但状态列显示「在线」，于是「这个模型用不了」这件事在面板上完全不可见
-   *  —— 有人只能进容器翻 state.json 才知道。
-   *
-   *  所以它与状态徽章**并列**展示（不是替代）：账号确实可用，只是有模型受限。
-   *  徽章里列具体有哪些模型受限，悬停再给出每个模型的恢复时间——上游台账里
-   *  带权威的重置时刻。 */
+  /** 模型详情按需展开，避免长模型名或大量受限模型撑高账号行。 */
   function renderModelLimit(a: Account) {
     const limited = rateLimitedModels(a);
     if (!limited.length) return null;
-    const sep = t('common.listSeparator');
-    const lines = limited.map((m) => {
-      const until = a.rate_limited_models?.find((x) => x.model === m.model)?.until;
-      // 用统一格式化（跟随界面语言，并带日期）：只给时分秒时跨天就分不清
-      // 「今晚恢复」还是「明晚恢复」。
-      const at = until ? fmtDateTime(Date.parse(until) / 1000) : '';
-      // 11102（该账号没有这个模型）与 6004（限流）含义不同：前者等多久都不会好，
-      // 该换模型；后者等一会儿就恢复。上游的 reason 前缀就是判据。
-      const why = m.reason.startsWith('11102')
-        ? t('accounts.modelMissing')
-        : at
-          ? t('accounts.modelLimitUntil', {at})
-          : t('accounts.modelLimited');
-      return `${m.model} · ${why}`;
-    });
-    // 徽章里**直接给出模型名**（用户反馈：只知道「有 2 个模型受限」不够用，得知道
-    // 是哪些，才能换模型或者告诉调用方避开它们）。名字可能很长（`global:` 前缀的
-    // 型号尤甚），所以最多列两个，其余用「+N」带过；完整清单与各自恢复时间仍在
-    // 悬停里——那里才是逐条说明的地方。
-    const MAX_INLINE = 2;
-    const names = limited.slice(0, MAX_INLINE).map((m) => m.model).join(sep);
-    const shown = limited.length > MAX_INLINE
-      ? `${names} +${limited.length - MAX_INLINE}`
-      : names;
     return (
-      <Badge
-        variant="secondary"
-        className="rounded-full text-amber-600 dark:text-amber-400"
-        title={[t('accounts.modelLimitTitle'), ...lines].join(String.fromCharCode(10))}
+      <Button
+        variant="outline" size="sm"
+        className="h-auto max-w-full cursor-pointer whitespace-normal rounded-lg px-2 py-1 text-left text-[11px] text-amber-600 dark:text-amber-400"
+        aria-haspopup="dialog"
+        onClick={() => setModelLimitTarget(a)}
       >
-        {t('accounts.modelLimitBadge', {models: shown})}
-      </Badge>
+        {t('accounts.modelLimitBadge', {extra: limited.length > 1 ? ` +${limited.length - 1}` : ''})}
+      </Button>
     );
   }
 
@@ -854,38 +1015,38 @@ export default function AccountsPage() {
           ? 'text-amber-600 dark:text-amber-400'
           : 'text-foreground';
     return (
-      // 固定列宽后这一列只有 12%：余额 + 来源徽标 + 到期倒计时挤在一行会**溢出**
-      // 并被下一列裁掉（issue #298 的现场就是「到期信息被 token 有效期列遮挡」）。
-      // 允许换行：空间够时仍是一行，窄窗口下倒计时自动落到第二行，而不是被切掉。
-      <span className="inline-flex max-w-full flex-wrap items-center gap-1.5">
-        <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
-          {fmtNumber(value)}
-        </span>
-        {fromSnapshot ? (
-          <span
-            className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-3 text-muted-foreground"
-            title={t('accounts.snapshotTitle')}
-          >
-            {t('accounts.snapshot')}
+      // 余额与来源放在首行，到期提示固定放在下方并左对齐。
+      <span className="inline-flex max-w-full flex-col items-start gap-1.5">
+        <span className="inline-flex max-w-full flex-wrap items-center gap-1.5">
+          <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
+            {fmtNumber(value)}
           </span>
-        ) : (
-          meta &&
-          (meta.cached ? (
+          {fromSnapshot ? (
             <span
-              className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
-              title={t('accounts.cacheTitle')}
+              className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-3 text-muted-foreground"
+              title={t('accounts.snapshotTitle')}
             >
-              {meta.cache_age != null ? t('accounts.cacheAge', {n: meta.cache_age}) : t('accounts.cache')}
+              {t('accounts.snapshot')}
             </span>
           ) : (
-            <span
-              className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-emerald-600 dark:text-emerald-400"
-              title={t('accounts.liveTitle')}
-            >
-              {t('accounts.live')}
-            </span>
-          ))
-        )}
+            meta &&
+            (meta.cached ? (
+              <span
+                className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
+                title={t('accounts.cacheTitle')}
+              >
+                {meta.cache_age != null ? t('accounts.cacheAge', {n: meta.cache_age}) : t('accounts.cache')}
+              </span>
+            ) : (
+              <span
+                className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-emerald-600 dark:text-emerald-400"
+                title={t('accounts.liveTitle')}
+              >
+                {t('accounts.live')}
+              </span>
+            ))
+          )}
+        </span>
         <CreditCountdown expiries={fromSnapshot ? undefined : meta?.expiries} />
       </span>
     );
@@ -1099,6 +1260,13 @@ export default function AccountsPage() {
                                  t('accounts.refreshDone'))}>
               <KeyRound className="h-3.5 w-3.5" />
             </Button>
+            {/* 单号刷新积分（issue #432）：账号多时只想更新这一个号的余额，
+                不必为它把整池都打一遍上游。 */}
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md"
+              title={t('accounts.refreshOneCredits')} disabled={busy}
+              onClick={() => void refreshOneCredits(a.file)}>
+              <Coins className="h-3.5 w-3.5" />
+            </Button>
           </>
         )}
         {!paused && hasClearableState && (
@@ -1163,8 +1331,8 @@ export default function AccountsPage() {
             'h-7 w-7 rounded-md ' +
             (stopped ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
           }
-          title={stopped ? t('accounts.enableTitle') : t('accounts.disableTitle')}
-          disabled={busy}
+          title={isAccountBanned(a) ? t('accounts.bannedHint') : stopped ? t('accounts.enableTitle') : t('accounts.disableTitle')}
+          disabled={busy || isAccountBanned(a)}
           onClick={() => run(
             a.file,
             // 传 `stopped` 的反面：自动禁用的号点这里会走「启用」，后端在启用路径上
@@ -1507,16 +1675,30 @@ export default function AccountsPage() {
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
-              <Select value={sort} onValueChange={(v) => { setSort(v as SortKey); setPage(1); }}>
+              <Select value={sort} onValueChange={(v) => {
+                setSort(v as SortKey); setSortDirection(v === 'added' ? 'desc' : 'asc'); setPage(1);
+              }}>
                 <SelectTrigger className="h-9 w-[150px] bg-background" aria-label={t('accounts.sortLabel')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="default">{t('accounts.sortDefault')}</SelectItem>
+                  <SelectItem value="manual">{t('accounts.sortManual')}</SelectItem>
                   <SelectItem value="remain">{t('accounts.sortRemain')}</SelectItem>
                   <SelectItem value="credits">{t('accounts.sortCredits')}</SelectItem>
+                  <SelectItem value="added">{t('accounts.sortAdded')}</SelectItem>
                 </SelectContent>
               </Select>
+              {sort !== 'default' && sort !== 'manual' && (
+                <Button variant="outline" size="sm" className="h-9 gap-1.5"
+                  aria-label={t('accounts.sortDirectionToggle', {direction: t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')})}
+                  onClick={() => { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); setPage(1); }}>
+                  {sortDirection === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />}
+                  {t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')}
+                </Button>
+              )}
             </div>
           </div>
+          {sort === 'added' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortAddedHint')}</p>}
+          {sort === 'manual' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortManualHint')}</p>}
         </section>
       )}
 
@@ -1557,10 +1739,10 @@ export default function AccountsPage() {
               {availabilityOf(a) === 'disabled' && (a.disabled_reason || isAdmin) && (
                 <div className="text-[11px] leading-4 text-rose-600 dark:text-rose-400">
                   {a.disabled_reason
-                    ? t('accounts.disabledReason', {reason: String(a.disabled_reason)})
+                    ? t('accounts.disabledReason', {reason: disabledReasonText(a)})
                     : t('accounts.badgeDisabled')}
                   {isAdmin && (
-                    <span className="text-muted-foreground"> · {reloginHint}</span>
+                    <span className="text-muted-foreground"> · {isAccountBanned(a) ? t('accounts.bannedHint') : reloginHint}</span>
                   )}
                 </div>
               )}
@@ -1590,12 +1772,12 @@ export default function AccountsPage() {
             固定布局把「列宽」从内容手里拿走：内容超宽就在本列内省略 / 换行，
             表格永远等于容器宽度，不再需要横向拖动。 */}
         <div className="hidden md:block">
-        <Table className="table-fixed [&_td]:overflow-hidden">
+        <Table className="table-fixed wb-first-left [&_td]:overflow-hidden">
           <TableHeader>
             <TableRow className="border-b border-border/60 hover:bg-transparent">
               <TableHead className="w-[17%] pl-4 text-[11px] text-muted-foreground">{t('accounts.colNickname')}</TableHead>
-              <TableHead className="w-[19%] text-[11px] text-muted-foreground">UID</TableHead>
-              <TableHead className="w-[9%] text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
+              <TableHead className="w-[14%] text-[11px] text-muted-foreground">UID</TableHead>
+              <TableHead className="w-[14%] text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="w-[14%] text-[11px] text-muted-foreground">{t('metric.credits')}</TableHead>
               <TableHead className="w-[13%] text-[11px] text-muted-foreground">{t('accounts.colExpiry')}</TableHead>
               {hasProxyUi && <TableHead className="w-[10%] text-[11px] text-muted-foreground">{t('accounts.proxyLine')}</TableHead>}
@@ -1604,8 +1786,16 @@ export default function AccountsPage() {
           </TableHeader>
           <TableBody>
             {paged.rows.map((a) => (
-              <TableRow key={a.file} className="border-b border-border/40">
-                <TableCell className="pl-4">
+              <TableRow
+                key={a.file}
+                data-uid={a.uid}
+                className={'border-b border-border/40' + (draggingUid === a.uid
+                  ? ' bg-primary/10 outline-2 -outline-offset-2 outline-primary/50' : '')}
+              >
+                <TableCell
+                  className={'pl-4' + (isAdmin && sort === 'manual' ? ' cursor-grab' : '')}
+                  onPointerDown={(e) => handleDragPointerDown(e, a)}
+                >
                   <div className="flex items-center gap-2.5">
                     {renderAvatar(a)}
                     <div className="min-w-0">
@@ -1631,9 +1821,7 @@ export default function AccountsPage() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     {renderStatus(a)}
                   </div>
-                  {/* 模型限流/缺模的提示放在状态**下面**另起一行：原先它与状态徽章
-                      挤在同一个 flex 行里，长模型名会把这一列撑宽、盖住右侧 UID 列
-                      （issue #313）。整行宽度给它，长名字也能读全。 */}
+                  {/* 状态与模型受限入口分行显示，详情点击展开。 */}
                   {renderModelLimit(a) && (
                     <div className="mt-1 max-w-full">{renderModelLimit(a)}</div>
                   )}
@@ -1733,14 +1921,14 @@ export default function AccountsPage() {
         </Link>
       </div>
 
-      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={reloadAll}
-                        upstreamId={groupId} />
+      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen}
+                        onSuccess={handleLoginSuccess} upstreamId={groupId} />
       <ReloginQueueDialog
         open={queueOpen}
         onOpenChange={setQueueOpen}
         accounts={visible}
         upstreamId={groupId}
-        onSuccess={reloadAll}
+        onSuccess={handleLoginSuccess}
         adminApiEnabled={adminApiEnabled}
       />
       <MoveAccountDialog
@@ -1784,6 +1972,11 @@ export default function AccountsPage() {
         onOpenChange={(open) => { if (!open) setCoolingTarget(null); }}
         onSuccess={reloadAll}
         upstreamId={groupId}
+      />
+      <AccountModelLimitsDialog
+        account={modelLimitTarget}
+        open={modelLimitTarget !== null}
+        onOpenChange={(open) => { if (!open) setModelLimitTarget(null); }}
       />
       <AccountTaskDialog
         account={taskTarget}

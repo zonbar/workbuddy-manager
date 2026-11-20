@@ -125,6 +125,20 @@ TRUSTED_PROXY_CIDRS = [
 ]
 # 是否暴露 /docs、/openapi.json、/redoc。生产环境建议关闭（默认关闭）。
 ENABLE_DOCS = _env('WB_ENABLE_DOCS', '0') == '1'
+
+# 静态前端产物（JS/CSS）未压缩时首屏可达 2 MB 量级，公网带宽有限（轻量服务器
+# 常见 3~6 Mbps）时表现为「页面很卡」。开启后文本类资源通常压到 25%~35%，
+# 实测首屏 1.98 MB -> 0.65 MB。
+#
+# 安全前提：Starlette 的 GZipMiddleware **内置跳过** `text/event-stream`，
+# 因此 /v1 的 SSE 流式响应不会被缓冲或改写（已实测验证：24 个 data 帧完整、
+# 含 [DONE]、无 content-encoding）。CPU 开销可忽略（压缩发生在静态资源首次
+# 命中，且 Etag 命中时浏览器直接续用缓存）。
+#
+# 需要关掉时设 WB_GZIP_ENABLED=0。
+GZIP_ENABLED = _env_bool('WB_GZIP_ENABLED', True)
+# 小于这个字节数的响应不压（避免给极小的 JSON / 错误体反而增大体积）。
+GZIP_MIN_SIZE = max(512, _env_int('WB_GZIP_MIN_SIZE', 1024))
 # 入站访问日志（安全页的「IP 访问日志」）是否记录**放行**的请求。
 #
 # 默认关闭：那张表的用途是安全审计（谁在扫我、谁被挡了），记全量会把信号淹没。
@@ -152,6 +166,22 @@ DEFAULT_ACCOUNT_PROXY = _env('WB_DEFAULT_ACCOUNT_PROXY', '')
 # 路径可用 WB_CCSWITCH_DIR / WB_ZCODE_DIR 覆盖（非默认安装位置），
 # 见 services/keyimport.py。
 LOCAL_IMPORT_ENABLED = _env_bool('WB_LOCAL_IMPORT', False)
+
+# ── 调用抓包（Trace Tap，见 services/tap.py）──────────────────────────────
+#
+# **默认关闭**：打开后会把每一次调用的请求体（system prompt、全部历史消息、
+# 工具定义）与模型回复写进本地库。这是排障时最想要的东西，也是最该由用户
+# 自己决定开不开的东西 —— 面板不替用户做这个决定。面板里可随时开关（状态
+# 存在 settings 表），这里的值只作为**默认值**。
+TAP_ENABLED = _env_bool('WB_TAP_ENABLED', False)
+# 单条请求/响应的存储上限（字节）。超出部分截断并标记，界面按原文展示。
+# 下限 4 KiB：再小连一个 system prompt 都存不下，抓了也没有意义。
+TAP_MAX_BODY = max(4096, _env_int('WB_TAP_MAX_BODY', 512 * 1024))
+# 保留天数：抓包是排障证据，过期就该消失，否则库会无声地涨到几十 GB。
+TAP_RETENTION_DAYS = max(1, _env_int('WB_TAP_RETENTION_DAYS', 7))
+# 会话数上限：按天清理之外再加一道「条数」闸门 —— 一个高频客户端能在一天
+# 里刷出上千个会话，只按时间清理挡不住它。
+TAP_MAX_SESSIONS = max(10, _env_int('WB_TAP_MAX_SESSIONS', 300))
 # 会话**总时长**上限（天）：登录后最多维持这么久，到点必须重新登录。
 #
 # 下限钳到 1 天：0（或负数）会让 cookie 的 exp 等于签发时刻，即「登录成功但
@@ -167,6 +197,13 @@ SESSION_DAYS = max(1, _env_int('WB_SESSION_DAYS', 1))
 SESSION_IDLE_HOURS = _env_int('WB_SESSION_IDLE_HOURS', 12)
 COOKIE_NAME = 'wb_session'
 SECURE_COOKIE = _env('WB_SECURE_COOKIE', 'auto')  # auto | true | false
+
+# 是否允许创建**自定义形态**的密钥（issue #447）：默认关闭。
+#
+# 关闭时只有 `wbk_` + 随机串（猜不到）；打开后可以填 `sk-xxx` 这类从别的网关
+# 迁过来的存量形态，代价是安全性取决于用户填的那串东西。默认关闭是为了让
+# 「没有任何人手动打开」的部署保持原有安全预期 —— 这是显式选择加入的能力。
+KEY_CUSTOM_ENABLED = _env_bool('WB_KEY_CUSTOM_ENABLED', False)
 
 # 允许的 CORS 来源（同源部署时留空即可）
 CORS_ORIGINS = [o for o in _env('WB_CORS_ORIGINS', '').split(',') if o]

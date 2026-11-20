@@ -97,6 +97,7 @@
 - **多上游** —— 「设置 → 上游」配多个实例，各带地址与 `api_key`
 - **安全** —— 入站 IP 白 / 黑名单（CIDR）、审计日志、会话与令牌分离
 - **更新与备份** —— 一键更新（核验发布包摘要）、PostgreSQL 异地备份
+- **轨迹（调用抓包）** —— 回放每一次调用的完整上下文；客户端 / 网关两个视角可切换，能看到网关改写了什么，也能和上一轮逐块对比，并可一键导出单文件 HTML
 - **五语种界面** —— 简体中文 / 繁体 / English / 日本語 / 한국어
 
 完整清单（每条带详解）见 [功能一览（完整版）](docs/features.md)。
@@ -120,6 +121,27 @@
 <img src="docs/images/logs.png" alt="调用日志" width="100%" />
 
 调用日志：每一笔的模型、状态、首字延迟与扣费
+
+<img src="docs/images/traces.png" alt="轨迹（调用抓包）" width="100%" />
+
+轨迹：一次 agent 任务里的每一轮请求与响应；客户端名与版本、上下文规模、工具清单都在一屏内
+
+<details>
+<summary><b>客户端视角 / 网关视角 / 与上一轮对比</b>（点击展开）</summary>
+
+<img src="docs/images/traces-headers-client.png" alt="客户端视角：客户端原样发出的请求头与请求体" width="100%" />
+
+客户端视角：客户端**原样**发出的请求头与请求体（密钥打码，保留前 6 位）
+
+<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往上游的请求" width="100%" />
+
+网关视角：网关改写后发往上游的请求，顶部列出被改写的字段（模型映射、参数钳制…）
+
+<img src="docs/images/traces-diff.png" alt="与上一轮对比" width="100%" />
+
+与上一轮对比：新增 / 修改的消息逐条列出，参数、system、工具变化分块显示
+
+</details>
 
 其余界面截图见 [界面预览（全部）](docs/screenshots.md)。
 
@@ -199,6 +221,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `POST` | `/v1/messages/count_tokens` | 网关密钥 | 按字符数粗估输入 token |
 | `GET` | `/v1/models` | 网关密钥 | 模型列表 |
 | `GET` | `/v1/usage` | 网关密钥 | 密钥自查：已用 / 剩余额度、有效期与模型范围（只读面板记录，不产生调用） |
+| `GET` | `/api/usage/token/` | 网关密钥 | 余额协议：当前密钥的剩余额度（供 new-api 客户端余额面板） |
+| `GET` | `/api/status` | 无 | 余额协议公开元数据：只声明数值单位，不含额度 |
+| `GET` | `/api/upstream/status` | 会话 | 上游运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
 | `GET` | `/healthz` | 无 | 存活探测（含上游连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
 | `POST` | `/api/login` `/api/logout` | 无 | 登录 / 登出 |
@@ -221,7 +246,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 安全说明
 
-- 密钥只在创建时显示一次，库里只存哈希；账号凭据不返回前端
+- 密钥用哈希校验，明文只在创建时展示一次、之后仅管理员可在密钥页再查看 / 复制（逐次记审计）；账号凭据不返回前端
 - 入站 IP 白 / 黑名单（支持 CIDR）、每把密钥的 IP 与模型白名单
 - 敏感操作全部留审计日志（谁、什么时候、做了什么）
 - 发布包校验：一键更新会核对发布页给的 sha256 与文件大小，不符即拒绝安装
@@ -234,7 +259,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 ## 已知限制
 
 - **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和上游后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
-- 请求的**请求体 / 响应体内容不做留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。
+- **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
+- 请求的**请求体 / 响应体内容默认不留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。需要排查「模型为什么这么答」时，可在底栏「轨迹」里显式打开抓包：内容只写本机、密钥类字段先脱敏、按保留期自动清理（见 [调用抓包](docs/api-traffic-tap.md)）。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
 
 ---
@@ -249,6 +275,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 - [部署指南](deploy/README.md) —— 反向代理、HTTPS、Windows 原生、一键更新
 - [账号出口线路](docs/account-proxy-routes.md) —— 每个账号走不同代理出口
 - [API 令牌](docs/api-tokens.md) —— 只读令牌与作用域
+- [调用抓包](docs/api-traffic-tap.md) —— 回放每一次调用的完整上下文
+- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与上游补丁要求
 - [页面监控](docs/watchdog.md) —— 上游网页改版检测、LLM 判读与邮件 / QQ 通知
 - [QQ 机器人通知与开放接口](docs/qq-bot.md) —— AstrBot 对接、UMO 与机器人控制边界
 

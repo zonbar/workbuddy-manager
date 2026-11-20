@@ -5,7 +5,15 @@ export interface Me {
   role: Role;
 }
 
+export interface RefreshRisk {
+  until: number; last_failure_at: number; failures: number;
+  needs_review: boolean; retry_after_sec: number; paused: boolean;
+}
+
 export interface Account {
+  /** 本面板记录的添加时间（Unix 秒）；旧账号/直接拷贝的文件可能未知。 */
+  added_at?: number | null;
+  refresh_risk?: RefreshRisk | null;
   proxy?: string;
   /**
    * 手写权重（issue #187）：上游选号的**乘数**，默认 1；0 = 未设置（等价 1）。
@@ -187,6 +195,27 @@ export interface DailyPlan {
   full: DailyTaskConfig;
 }
 
+/** 上游与面板两套调度的重叠状态（issue #375）。 */
+export interface TaskSchedulerStatus {
+  upstream: {
+    available: boolean;
+    /** 上游 config.json 的 schedule.checkin_enabled */
+    checkin: boolean;
+    /** 上游 schedule.activity_enabled（内部含领取补偿） */
+    activity: boolean;
+  };
+  panel: Record<DailyTask, boolean>;
+  /** 两套都开的重叠任务：checkin / compensation */
+  conflicts: string[];
+}
+
+export interface TaskSchedulerApply {
+  plan: DailyPlan;
+  scheduler: TaskSchedulerStatus;
+  reload_scheduled: boolean | null;
+  reload_hint?: string;
+}
+
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
 export interface PoolCounts {
   total: number;
@@ -276,6 +305,8 @@ export interface ProxyProbe {
   exit_ip?: string;
   exit_info?: string;
   error?: string;
+  /** 失败时的可行动提示（协议/端口/认证/规则），原始 error 仍保留 */
+  hint?: string;
 }
 
 export interface ProxySettings {
@@ -457,6 +488,10 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /** 每日 token 限额：0 = 不限；与 quota 各自独立，任一超限即拒绝 */
+  daily_quota: number;
+  /** 今天（服务器本地日期）已用的 token，次日 0 点归零 */
+  daily_used_tokens: number;
   /**
    * 绑定的上游接入点（多上游 / 分组隔离）；null = 默认上游。
    *
@@ -642,6 +677,12 @@ export interface RequestLog {
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或该行在功能上线前写入，
+   * 界面显示「—」——不能显示 ¥0，那会被读成「这次调用免费」。
+   */
+  cost: number | null;
   latency_ms: number;
   /**
    * 首字延迟（毫秒）：从发起上游请求到收到第一个含正文的 delta。
@@ -683,6 +724,10 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /** 按 DeepSeek 官方价估算的费用（元）；null = 这天没有可计价的调用 */
+  cost: number | null;
+  /** 这天里没计入费用的请求数 */
+  unpriced_requests: number;
   /**
    * 当日失败请求数（4xx + 5xx 合计）。
    *
@@ -693,6 +738,8 @@ export interface UsagePoint {
    * 可选：老版本后端不返回该字段，界面按 0 处理（不显示失败）。
    */
   failed?: number;
+  /** 当日成功请求数（2xx，issue #369 第 3 点）；同样来自 request_logs。 */
+  success?: number;
 }
 
 /**
@@ -713,6 +760,8 @@ export interface UsageHourPoint {
   credit: number;
   /** 该小时的失败请求数（来自请求日志，与 `UsagePoint.failed` 同一口径） */
   failed: number;
+  /** 该小时的成功请求数（2xx） */
+  success?: number;
 }
 
 /** 一天的积分收入 / 支出（`/api/stats/credits` 的 daily 项） */
@@ -761,6 +810,44 @@ export interface CreditsFlow {
   hourly?: CreditsFlowHourPoint[];
 }
 
+export interface AccountUsageRow {
+  day: string;
+  account: string;
+  nickname: string;
+  uid8: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageRow {
+  account: string;
+  nickname: string;
+  uid8: string;
+  model: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageResponse {
+  items: AccountModelUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
+export interface AccountUsageResponse {
+  items: AccountUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
 export interface UsageBreakdown {
   name: string;
   requests: number;
@@ -768,6 +855,14 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或全在该列上线前，
+   * 界面显示「—」。**不是 0**：0 会被读成「免费」。
+   */
+  cost: number | null;
+  /** 同一维度里没有计入费用的请求数（模型不在价目表 / 历史行） */
+  unpriced_requests: number;
   /**
    * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
    * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
@@ -777,6 +872,67 @@ export interface UsageBreakdown {
   throughput_samples?: number;
 }
 
+/**
+ * 实时指标（`GET /api/stats/realtime`）。
+ *
+ * 与 `StatsSummary` 那类累计值口径不同，界面上必须分组显示：
+ * `inflight` / `capacity` 是**此刻**的瞬时值（来自上游 `/status`），上游不可达时
+ * 整组缺失；`rpm_*` / `peaks` / `series` 来自本库 `request_logs`，只含已完成请求。
+ */
+export interface StatsRealtimeSeries {
+  /** 窗口长度（秒） */
+  window: number;
+  /** 每个桶多少秒 */
+  step: number;
+  /** 窗口起点（epoch 秒，已对齐到 step 的整数倍） */
+  start: number;
+  end: number;
+  /** 每个桶的请求数 */
+  rpm: number[];
+  /** 每个桶内的并发峰值 */
+  concurrency: number[];
+}
+
+export interface StatsRealtimePeaks {
+  concurrency: number;
+  rpm: number;
+  /** 参与计算的行数：0 表示这段时间没有任何已完成请求 */
+  samples: number;
+}
+
+export interface StatsRealtime {
+  /** 上游 `/status` 是否取到；false 时只有 rpm_* / peaks / series 有效 */
+  available: boolean;
+  /**
+   * 客户端在途：面板正在处理、还没把响应写完的条数（含流式全过程、含排队）。
+   * 与 `inflight`（上游槽位占用）是两个视角，界面上一个当主数字、一个当小字。
+   */
+  client_inflight?: number;
+  /** 取不到上游时的原因（直接展示，服务端文案） */
+  error?: string;
+  days: number;
+  updated_at: number;
+  /** 最近 60 秒的请求数（即「此刻的 RPM」） */
+  rpm_60: number;
+  rpm_5m: number;
+  rpm_3m: number;
+  peaks: StatsRealtimePeaks;
+  series: StatsRealtimeSeries;
+  /** 以下仅在 available 时存在 */
+  inflight?: number;
+  busy_accounts?: number;
+  accounts_total?: number;
+  /** 国内版（`cn`）账号的单账号在途上限（`pool.max_in_flight`） */
+  per_account_limit?: number;
+  /** 国际版账号的单账号在途上限（`pool.max_in_flight_global`，不是全池上限） */
+  per_account_limit_global?: number;
+  /** 全池同时在途上限 = 各账号按 realm 取上限后求和 */
+  /** 总在途上限；`null` = 不限（上游 `pool.max_in_flight` 为 0）。缺失 = 上游不可达。 */
+  capacity?: number | null;
+  full_accounts?: number;
+  healthy?: number;
+  sticky?: number;
+}
 export interface StatsSummary {
   today_requests: number;
   today_tokens: number;
@@ -784,6 +940,19 @@ export interface StatsSummary {
   today_credit: number;
   week_credit: number;
   total_credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 该区间内没有任何可计价的调用（与「0 元」不同，界面显示「—」）。
+   */
+  today_cost: number | null;
+  week_cost: number | null;
+  total_cost: number | null;
+  /** 同一区间内**没有**计入费用的请求数——有它才能说清金额只覆盖了一部分调用 */
+  today_unpriced: number;
+  week_unpriced: number;
+  total_unpriced: number;
+  /** 费用币种（目前只有 CNY） */
+  cost_currency: string;
   week_requests: number;
   week_tokens: number;
   total_requests: number;
@@ -838,7 +1007,7 @@ export interface IpAccessLog {
   ua: string | null;
   /**
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
-   * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
+   * key_disabled / key_expired / quota_exhausted / daily_quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
    * rate_limited / key_auth_flood 等。
    *
@@ -1211,9 +1380,9 @@ export interface Versions {
  * 这一列空的时候有四种完全不同的原因，后端把事实与判断依据一起返回。
  */
 export interface AccountBackfillInfo {
-  /** native = 读日志文件；docker = docker logs */
-  mode: 'native' | 'docker';
-  /** native 是文件路径，docker 是容器名 */
+  /** native = 日志文件；docker = docker logs；systemd = journal */
+  mode: 'native' | 'docker' | 'systemd';
+  /** native 是文件路径，docker 是容器名，systemd 是 unit 名 */
   source: string;
   /** 最近一次采集的时刻（epoch 秒，0 = 还没跑过） */
   checked_at: number;
@@ -1269,6 +1438,26 @@ export interface GithubMirror {
   source: 'panel' | 'env' | '';
   /** 界面上的快捷选项 */
   presets: string[];
+}
+
+/**
+ * 网关数据面 CORS（issue #445）。
+ *
+ * 与 `WB_CORS_ORIGINS`（管理面 `/api/*`，Cookie 会话）是**两套**东西：
+ * 这里管 `/v1`、`/v2`，鉴权走 Bearer，所以允许 `*`。
+ */
+export interface GatewayCors {
+  enabled: boolean;
+  /** 来源白名单；`*` = 任意，`null` = file:// 页面的字面量来源 */
+  origins: string[];
+  /** 预检结果缓存秒数（0 = 不缓存） */
+  max_age: number;
+  /** 条数上限（超过时保存会被拒） */
+  max_origins: number;
+  /** 本配置作用的路径前缀 */
+  prefixes: string[];
+  /** 管理面来源（`WB_CORS_ORIGINS`，只读展示） */
+  admin_origins: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */
@@ -1768,4 +1957,236 @@ export interface WatchdogQqTest extends WatchdogQqBotsResult {
   message?: string;
   sent_at?: number;
   umo?: string;
+}
+
+/* ── 计费价目（issue #380）──────────────────────────────── */
+export interface PricingModelRate {
+  cache_hit?: {peak?: number; off_peak?: number};
+  cache_miss?: {peak?: number; off_peak?: number};
+  output?: {peak?: number; off_peak?: number};
+}
+
+export interface PricingVersion {
+  effective_from: string;
+  verified_at: string;
+  source: string;
+  source_note?: string;
+  holiday_source?: string;
+  models: Record<string, PricingModelRate & {label?: string}>;
+  peak_windows: number[][];
+  peak_days: number[];
+  holiday_years: string[];
+  /** 是否是管理员自己覆盖的版本（不是随版本分发的那份） */
+  overridden: boolean;
+  /** 距上次核对官方价目的天数；null = 没写核验日期 */
+  age_days: number | null;
+}
+
+/**
+ * 价目表状态。
+ *
+ * `missing_holiday_years` 非空表示**节假日安排缺这一年**：那段时间的高峰判定
+ * 会退化成「只看周几」，节假日里本来该按空闲价算的调用会被按高峰价计（高估一倍）。
+ */
+export interface PricingInfo {
+  currency: string;
+  money_unit: string;
+  versions: PricingVersion[];
+  active: Record<string, unknown> | null;
+  is_peak_now: boolean;
+  override: Record<string, unknown> | null;
+  has_override: boolean;
+  missing_holiday_years: number[];
+  stale_after_days: number;
+  aliases: Record<string, string>;
+  priced_models: string[];
+}
+
+/* ── 调用抓包（Trace Tap，见 docs/api-traffic-tap.md）──────────────────
+ *
+ * 与请求日志（`RequestLog`）是两套数据：那边的每一行只是**计量**，
+ * 这里的每一行是**证据** —— 完整请求体、完整响应、重建后的模型输出。
+ */
+
+/** 抓包开关与容量。 */
+export interface TapConfig {
+  enabled: boolean;
+  /** 单条请求/响应的存储上限（字节），超出即截断并标记。 */
+  max_body: number;
+  /** 保留天数。 */
+  retention_days: number;
+  /** 会话数上限。 */
+  max_sessions: number;
+}
+
+export interface TapStats {
+  sessions: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  first_at: number | null;
+  last_at: number | null;
+}
+
+export interface TapConfigResponse {
+  config: TapConfig;
+  stats: TapStats;
+}
+
+/** 一次 agent 任务（按 system + 首条 user 消息的指纹归并）。 */
+export interface TapSession {
+  id: number;
+  fingerprint: string;
+  key_id: number | null;
+  key_name: string | null;
+  client: string | null;
+  /** 原始 UA。`client` 是从它派生的分类，版本号也从这里取。 */
+  client_ua?: string | null;
+  /** `main` = 一轮对话；`title` 等 = 辅助调用（会话标题生成），属于某条主会话。 */
+  kind: string;
+  /** 辅助调用所属的主会话 id。 */
+  parent_id: number | null;
+  /** 这条主会话底下挂了几次辅助调用（标题 / 压缩）。 */
+  aux_count?: number;
+  /** 客户端说的协议：chat / anthropic / responses。 */
+  protocol: string;
+  model: string | null;
+  started_at: number;
+  updated_at: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 会话里的一轮（详情列表项，不含正文）。 */
+export interface TapTurnBrief {
+  id: number;
+  seq: number;
+  ts: number;
+  status: number | null;
+  stream: boolean;
+  latency_ms: number | null;
+  first_token_ms: number | null;
+  model: string | null;
+  mapped_model: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cost: number | null;
+  error: string | null;
+  truncated: boolean;
+  protocol: string | null;
+  request_bytes: number;
+  response_bytes: number;
+}
+
+export interface TapSessionDetail extends TapSession {
+  items: TapTurnBrief[];
+  /** 挂在它名下的辅助调用（点一下可跳转）。 */
+  aux?: {id: number; kind: string; ts: number; model: string | null}[];
+}
+
+/** 请求体的结构摘要（后端现算，不落库）。 */
+export interface TapTurnSummary {
+  messages: number;
+  roles: Record<string, number>;
+  tools: number;
+  system_chars: number;
+  tool_names: string[];
+}
+
+export interface TapToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** 流式响应重建的结果。 */
+export interface TapRecon {
+  text: string;
+  reasoning: string;
+  tool_calls: TapToolCall[];
+  finish?: string | null;
+  events?: number;
+  done?: boolean;
+}
+
+/** 一轮完整内容。 */
+export interface TapTurn extends Omit<TapTurnBrief, 'request_bytes' | 'response_bytes'> {
+  session_id: number;
+  path: string | null;
+  request: Record<string, unknown> | null;
+  /** false = 被截断或格式异常，只能看原文（`request_raw`）。 */
+  request_ok: boolean;
+  request_raw: string | null;
+  response: unknown;
+  response_ok: boolean;
+  response_raw: string | null;
+  recon: TapRecon;
+  usage: Record<string, unknown>;
+  summary: TapTurnSummary;
+
+  /* ── 两端视角 ────────────────────────────────────────────────
+   *
+   * 一次调用有两份请求、两份响应，缺哪一份都排不了「网关/转换层改了什么」：
+   *   · 请求：`request.body` 是客户端**原样**发的，`request.upstream_body`
+   *     是网关改写后发往上游的；
+   *   · 响应：`upstream_*` 是网关卡在上游与客户端中间看到的原文，
+   *     `client_*` 是客户端手里真正收到的那份。
+   *
+   * 对 Chat 协议两者相同（透传），`passthrough` 为 true。
+   */
+  upstream_response: unknown;
+  upstream_response_ok: boolean;
+  upstream_recon: TapRecon;
+  client_response: unknown;
+  client_response_ok: boolean;
+  /** 客户端视角无法解析成 JSON 时的原文（流式或已截断）。 */
+  client_response_raw: string | null;
+  client_recon: TapRecon | null;
+  passthrough: boolean;
+  client_protocol: string;
+  /** 关联键：网关发往上游时带的 X-Trace-ID（对账用）。NULL = 老记录。 */
+  trace_id?: string | null;
+}
+
+/** 两轮请求的结构化差异（claude-tap 的 diff 视图）。 */
+export interface TapDiff {
+  before: {id: number; seq: number; ts: number; model: string | null};
+  after: {id: number; seq: number; ts: number; model: string | null};
+  params: {key: string; before: string | null; after: string | null}[];
+  system: {
+    changed: boolean;
+    before_chars: number;
+    after_chars: number;
+    before: string;
+    after: string;
+  };
+  messages: {
+    before_total: number;
+    after_total: number;
+    common: number;
+    added: {index: number; role: string; preview: string; chars: number}[];
+    removed: {index: number; role: string; preview: string}[];
+    changed: {index: number; role: string; before: string; after: string}[];
+  };
+  tools: {
+    added: string[];
+    removed: string[];
+    changed: {name: string; before: string; after: string}[];
+  };
+  summary: {
+    params: number;
+    system: number;
+    added: number;
+    removed: number;
+    changed: number;
+    tools: number;
+  };
+  /**
+   * true = 两轮请求体都被截断，这次比的是**摘要**（逐条消息的角色 + 内容哈希），
+   * 而不是请求体全文 —— 截断会把两轮切在同一位置，比前缀必然「完全一致」。
+   */
+  from_digest?: boolean;
 }

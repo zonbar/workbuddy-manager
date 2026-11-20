@@ -8,6 +8,7 @@ import {
   KeyRound,
   Boxes,
   ScrollText,
+  Radar,
   TrendingUp,
   ShieldCheck,
   Settings,
@@ -606,6 +607,15 @@ export function ManagementBar() {
       groupKey: 'governance',
     },
     {
+      // 轨迹（调用抓包）与请求日志同属「治理」组，但**同级的入口**：
+      // 日志回答「谁用了多少」，轨迹回答「这一轮到底发了什么、改了什么」，
+      // 是两种不同的动作（扫一眼 vs 逐轮对比），不该藏进二级导航里。
+      title: t('nav.traces'),
+      icon: <Radar {...IconOptions} />,
+      href: '/traces',
+      groupKey: 'governance',
+    },
+    {
       title: t('nav.security'),
       icon: <ShieldCheck {...IconOptions} />,
       href: '/security',
@@ -904,9 +914,15 @@ export function ManagementBar() {
         onPointerCancel={handleDockPointerEnd}
         onClickCapture={handleDockClickCapture}
         style={
-          dockPosition ?
-            {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
-            {visibility: 'hidden'}
+          // 个人信息 / 快速添加弹窗打开时把底栏整个藏起来（issue #406）：遮罩是
+          // 半透明的，底栏会留在下面，而鼠标跟随的放大动画不会自己复位，看起来
+          // 像「弹窗开着底栏还在动」。快速添加原本就因焦点转移而停住，这里把两个
+          // 弹窗统一处理，避免两处行为不一致。
+          profileOpen || addOpen ?
+            {visibility: 'hidden'} :
+            dockPosition ?
+              {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
+              {visibility: 'hidden'}
         }
       >
         {showDockTip && (

@@ -9,21 +9,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as _StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
 import json
 import logging
 
-from . import config, db, redpacket, security
+from . import config, db, inflight, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
-    accounts, anthropic, auth, gateway, keys, logs, models, playground,
+    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs, models,
+    playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
-    proxies, settings, stats, system, tokens, upstreams, watchdog as watchdog_router,
+    proxies, settings, stats, system, tap as tap_router, tokens, upstreams,
+    watchdog as watchdog_router,
 )
 from .services import (
-    accountlog, autoupdate, cooling, dailyplan, modelrecovery, pgsync, renew, tasklog,
-    taskrun, watchdog,
+    accountlog, accountrisk, autoupdate, cooling, dailyplan, gatewaycors, modelrecovery, pgsync,
+    renew, tasklog, taskrun, watchdog,
 )
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
@@ -55,6 +58,8 @@ async def lifespan(app: FastAPI):
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
+    accountrisk.initialize()
+    accountrisk.start()
     # 定时领奖（成长任务里幂等的那一半）：只把已完成任务的奖励领回来，不伪造
     # 任何活跃上报，因此可以安全地到点自动跑。点亮那半只允许手动（见 taskrun）
     taskrun.start_scheduler()
@@ -84,6 +89,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         tasklog.stop_collector()
+        accountrisk.stop()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
         cooling.stop_scheduler()
@@ -144,7 +150,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.6',
+    version='2.11.21',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -181,6 +187,173 @@ if config.CORS_ORIGINS:
         allow_methods=['*'],
         allow_headers=['*'],
     )
+
+# ── 数据面 CORS（`/v1`、`/v2`）────────────────────────────────────
+#
+# 与上面 `WB_CORS_ORIGINS` 是**两套**东西，别合并：
+#   · 上面那套管 `/api/*`（Cookie 会话），`allow_credentials=True`，禁止 `*`；
+#   · 这一套管 `/v1`、`/v2`（`Authorization: Bearer`），不涉及 Cookie，因此
+#     可以允许 `*` —— 任何网页都能跨域发请求，但拿不到密钥还是调不动。
+#
+# 为什么不用 `CORSMiddleware`：它的 allow_origins 是启动时固定的，改配置要重启。
+# 而这是面板上的配置项 —— 改完不生效会被当成「没保存成功」，所以这里每请求现读
+# 设置（读 SQLite 一行），即时生效。
+#
+# 预检由这里直接应答：`/v1/*` 只有 POST 路由，OPTIONS 落到路由表会被 405，
+# 浏览器那边就报跨域失败 —— 这是 issue #445 现象的直接来源。
+_CORS_ALLOW_HEADERS = 'authorization,content-type,x-api-key,anthropic-version,x-trace-id'
+
+# 预检里回显 `Access-Control-Request-Headers` 的白名单前缀/全名。
+#
+# 为什么不能直接把请求方要的头原样回显：那等于对任意头放行。但只回一份固定
+# 列表又会挡住真实客户端 —— OpenAI SDK 会带 `openai-organization`、
+# `openai-beta`，Anthropic SDK 会带 `anthropic-beta`，这些请求会因为预检失败
+# 而根本发不出去。折中：命名空间前缀 + 明确列出的头名，其余一律不放。
+_CORS_ALLOWED_HEADER_EXACT = frozenset(_CORS_ALLOW_HEADERS.split(','))
+_CORS_ALLOWED_HEADER_PREFIXES = ('x-stainless-', 'anthropic-', 'openai-')
+
+
+def _echo_request_headers(requested: str) -> str:
+    """把预检请求要的头裁到白名单内，返回可直接写进响应头的值。
+
+    返回空串表示「一个都不允许」——调用方据此把整个预检拒掉，而不是给一个
+    缺头的允许响应（那样浏览器照样拦，但报错方向会误导人）。
+    """
+    wanted: list[str] = []
+    for raw in (requested or '').split(','):
+        name = raw.strip().lower()
+        if not name or not name.isascii():
+            continue
+        # 头名只允许 token 字符（RFC 7230）——防止有人拿逗号/换行拼出额外的头
+        if any(ch not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for ch in name):
+            continue
+        if name in _CORS_ALLOWED_HEADER_EXACT or name.startswith(_CORS_ALLOWED_HEADER_PREFIXES):
+            # 只有前缀、没有后半截（如 `openai-`）不是有效头名
+            if name.endswith('-'):
+                continue
+            if name not in wanted:
+                wanted.append(name)
+    return ','.join(wanted)
+_CORS_ALLOW_METHODS = 'GET,POST,OPTIONS'
+
+
+def _merge_vary_origin(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """把 `Origin` 并进 `Vary`（已有值保留）。
+
+    CORS 响应的缓存正确性依赖 `Vary: Origin`：同一个 URL 对不同来源回不同的
+    `Access-Control-Allow-Origin`，不声明就会让共享缓存把一份响应发给另一个来源。
+    下游可能已经写了 `Vary: Accept-Encoding`（压缩），所以这里**合并**而不是追加
+    一条独立的 `Vary`（多条 Vary 的语义是「所有值的并集」，但不少代理只看第一条）。
+    """
+    out: list[tuple[bytes, bytes]] = []
+    merged: list[str] = []
+    for key, value in headers:
+        if key.lower() != b'vary':
+            out.append((key, value))
+            continue
+        for item in value.decode('latin-1').split(','):
+            name = item.strip()
+            if name and not any(n.lower() == name.lower() for n in merged):
+                merged.append(name)
+    if not any(n.lower() == 'origin' for n in merged):
+        merged.append('Origin')
+    # 只写一条 Vary：多条虽然语义上是并集，但不少代理/缓存实现只看第一条
+    out.append((b'vary', ', '.join(merged).encode('latin-1')))
+    return out
+
+
+class GatewayCorsMiddleware:
+    """纯 ASGI：只处理数据面路径，来源白名单每次现读面板设置。"""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+        path = scope.get('path') or ''
+        if not gatewaycors.is_data_api_path(path):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode('latin-1').lower(): v.decode('latin-1')
+                   for k, v in scope.get('headers') or []}
+        origin = headers.get('origin') or ''
+        cfg = gatewaycors.settings()
+        allow = gatewaycors.allow_origin_value(origin, cfg)
+
+        # 预检：直接应答，不进路由（进了也是 405）。
+        if scope.get('method') == 'OPTIONS' and headers.get('access-control-request-method'):
+            if not allow:
+                # 来源未放行：回 403 而不是静默 200 —— 静默放行会让浏览器在
+                # 真实请求上才失败，用户看不到「预检被拒」这个明确信号。
+                # 403 也带 `Vary: Origin`：否则中间缓存可能把一个来源的拒绝
+                # 结果复用给另一个来源。
+                response = JSONResponse(
+                    {'error': {'message': '来源不在网关 CORS 白名单内',
+                               'type': 'cors_error', 'code': 'origin_not_allowed'}},
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
+                await response(scope, receive, send)
+                return
+            # 没有 `Access-Control-Request-Headers` 是**合法**的（简单请求的
+            # 预检只问方法）；只有「要了头但一个都不在白名单里」才拒。
+            raw_requested = headers.get('access-control-request-headers') or ''
+            requested = _echo_request_headers(raw_requested)
+            if raw_requested.strip() and not requested:
+                response = JSONResponse(
+                    {'error': {'message': '预检请求了不被允许的自定义请求头',
+                               'type': 'cors_error', 'code': 'header_not_allowed'}},
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
+                await response(scope, receive, send)
+                return
+            extra = [
+                (b'access-control-allow-origin', allow.encode('latin-1')),
+                (b'access-control-allow-methods', _CORS_ALLOW_METHODS.encode()),
+                (b'access-control-allow-headers', requested.encode('latin-1')),
+                (b'access-control-max-age', str(cfg['max_age']).encode()),
+                (b'vary', b'Origin'),
+            ]
+            await send({'type': 'http.response.start', 'status': 204, 'headers': extra})
+            await send({'type': 'http.response.body', 'body': b''})
+            return
+
+        if not allow:
+            await self.app(scope, receive, send)
+            return
+
+        # 普通请求：补上 CORS 头。注意**不加** allow-credentials —— 数据面用
+        # Bearer，不需要 Cookie；带上一旦将来来源放宽成 `*` 就会与规范冲突。
+        #
+        # **必须先删掉下游已有的同名头再加自己的**：`WB_CORS_ORIGINS` 装上全局
+        # `CORSMiddleware` 时它也会处理 `/v1`，两层各加一次的结果是
+        # `Access-Control-Allow-Origin: https://a, https://a` —— 浏览器按单个值
+        # 解析，重复值直接判定为非法来源，表现为「明明加了白名单还是跨域」。
+        # 实测确认过（见 test_gateway_cors.GlobalCorsCoexistenceTest）。
+        # 同理丢掉对方的 allow-credentials：数据面不该声明它。
+        async def send_with_cors(message):
+            if message.get('type') == 'http.response.start':
+                message = dict(message)
+                drop = {b'access-control-allow-origin', b'access-control-allow-credentials'}
+                headers = [(k, v) for k, v in message.get('headers') or []
+                           if k.lower() not in drop]
+                headers.append((b'access-control-allow-origin', allow.encode('latin-1')))
+                if b'access-control-expose-headers' not in {k.lower() for k, _ in headers}:
+                    headers.append((b'access-control-expose-headers',
+                                    b'x-trace-id,x-request-id'))
+                # Vary 必须**并进已有值**，不能「有就跳过」：下游可能已经带了
+                # `Vary: Accept-Encoding`（压缩中间件），跳过就等于没声明按 Origin
+                # 区分，共享缓存会把 A 来源的响应复用给 B 来源。
+                headers = _merge_vary_origin(headers)
+                message['headers'] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
+
+app.add_middleware(GatewayCorsMiddleware)
 
 # 管理端请求体上限。网关那条路有自己的逐块校验（gateway._read_json_body），
 # 但 `/api/*` 此前**没有任何上限** —— 未鉴权的 `/api/login` 就能用大 body
@@ -279,17 +452,100 @@ class ApiBodyLimitMiddleware:
             await response(scope, receive, send)
 
 
+# 计入「客户端在途」的路径：只有网关调用算，面板自身的 /api/* 不算。
+#
+# 必须覆盖**所有**模型调用入口，漏一条就会让这个数字结构性偏小 —— 而它存在的
+# 意义正是「与上游槽位占用比对，看出是否在排队」：
+#   · `/v1/`   OpenAI / Anthropic 兼容层（chat / messages / models / tools…）
+#   · `/v2/`   `/v2/chat/completions`（部分客户端直接打这个路径）
+#   · `/responses` OpenAI SDK 的 `responses.create` 在 baseURL 不含 `/v1` 时走的
+#                 就是这条（见 routers/responses.py 的注释）
+# 用**按路径段**判定而不是 `startswith('/v1')`：后者会把 `/v1foo` 也吃进来。
+GATEWAY_PATH_PREFIXES = ('/v1/', '/v2/')
+# 不带前缀的网关端点（精确匹配，避免误吃 `/responses-admin` 之类）
+GATEWAY_BARE_PATHS = ('/responses',)
+
+
+def _is_gateway_path(path: str) -> bool:
+    return path in GATEWAY_BARE_PATHS or path.startswith(GATEWAY_PATH_PREFIXES)
+
+
+class GatewayInFlightMiddleware:
+    """统计「客户端在途」：`/v1/*`、`/v2/*`、`/responses` 从请求进来到**响应写完**
+    （含整个流式传输）。
+
+    为什么按这几条路径划：这些才是 agent 客户端的模型调用（chat / responses /
+    messages / models）。面板自己的 `/api/*` 是浏览器在翻页，算进来会把数字搅乱。
+
+    为什么要在中间件里数而不是从日志推：日志只有请求**结束**时才写，正在跑的那条
+    根本不在库里。要「此刻几条」，只能在进程内数。
+
+    注意 `await self.app(...)` 对 `StreamingResponse` 而言是等整个 body 发完才返回，
+    所以一条边吐 chunk 边跑的请求在这段时间里始终算 1。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = str(scope.get('path') or '')
+        if scope.get('type') != 'http' or not _is_gateway_path(path):
+            await self.app(scope, receive, send)
+            return
+        inflight.enter()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            inflight.leave()
+
+
+app.add_middleware(GatewayInFlightMiddleware)
 app.add_middleware(ApiBodyLimitMiddleware)
+
+# 压缩静态资源（web/out 下的 JS/CSS，首屏 2 MB 的大头）。
+#
+# 为什么**只压静态资源**而不是全局：
+#   · 本应用外层还有 `@app.middleware('http')`（cache_headers / 限流），那层会把
+#     下游响应包成**流式**转发，Starlette 的 GZipMiddleware 遇到流式响应会无条件
+#     压缩，`minimum_size` 直接失效 —— 实测 140 字节的 /api/status 也被压了，
+#     白白付 CPU 与几字节头开销。
+#   · 全局压缩还会碰到 `/v1` 的流式对话；虽然 Starlette 会跳过 text/event-stream，
+#     但静态路径白名单更明确，不依赖它对 content-type 的判定。
+_STATIC_COMPRESS_SUFFIXES = ('.js', '.css', '.svg', '.json', '.map', '.txt', '.woff2')
+
+
+class StaticGzipMiddleware:
+    """只对静态产物做 gzip；其余请求原样穿过（含 /v1 流式与管理面 JSON）。"""
+
+    def __init__(self, app, *, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.gz = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') == 'http' and scope.get('method') in ('GET', 'HEAD'):
+            path = scope.get('path') or ''
+            if path.startswith('/_next/') or path.endswith(_STATIC_COMPRESS_SUFFIXES):
+                await self.gz(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+if config.GZIP_ENABLED:
+    app.add_middleware(StaticGzipMiddleware, minimum_size=config.GZIP_MIN_SIZE)
 
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)
 app.include_router(accounts.router)
+app.include_router(accountrisk_router.router)
 app.include_router(keys.router)
 # 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
 app.include_router(redpackets.router)
 # 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
 app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
+# 调用抓包（Trace Tap）：把每次调用的完整上下文留在面板里回放与对比，
+# 与请求日志是两套数据（见 services/tap.py 的模块注释）
+app.include_router(tap_router.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
 # 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
@@ -306,6 +562,8 @@ app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# 余额协议（/api/usage/token/ 与 /api/status）：客户端面板据此显示剩余额度
+app.include_router(balance.router)
 # Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
 app.include_router(anthropic.router)
 # OpenAI Responses API 兼容层（/v1/responses、/responses）——给 Codex /

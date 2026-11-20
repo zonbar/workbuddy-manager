@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+from contextlib import asynccontextmanager
 import json
 import os
 import re
@@ -133,6 +134,32 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
     return billing_headers(realm, auth)
 
 
+def _refresh_retry_after(resp: httpx.Response) -> int:
+    from email.utils import parsedate_to_datetime
+    raw = resp.headers.get('retry-after', '')
+    try:
+        seconds = int(raw)
+    except (ValueError, TypeError):
+        try:
+            seconds = int(parsedate_to_datetime(raw).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            try:
+                body = resp.json()
+                seconds = int(body.get('retry_after') or (body.get('retry_policy') or {}).get('retry_after') or 300)
+            except (ValueError, TypeError, AttributeError):
+                seconds = 300
+    return max(300, min(21600, seconds))
+
+
+@asynccontextmanager
+async def _risk_checked_client(client, auth: dict):
+    from . import accountrisk
+    if await accountrisk.paused(str(auth.get('uid') or ''), auth['_risk_auth_dir']):
+        raise RuntimeError('账号已保护性暂停，未向腾讯发送请求；请先检查账号预警')
+    async with client as active:
+        yield active
+
+
 def _account_http_client(auth: dict, *, lane: str = ''):
     """账号出站客户端（按账号线路选代理）。
 
@@ -146,8 +173,10 @@ def _account_http_client(auth: dict, *, lane: str = ''):
     # 多传一个空 lane 会把它们全打红，而语义上「默认车道」本来就不该有痕迹。
     extra = {'lane': lane} if lane else {}
     if proxy is None:
-        return config.http_client(config.TENCENT_TIMEOUT, connect=5, **extra)
-    return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy, **extra)
+        client = config.http_client(config.TENCENT_TIMEOUT, connect=5, **extra)
+    else:
+        client = config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy, **extra)
+    return _risk_checked_client(client, auth) if '_risk_auth_dir' in auth else client
 
 
 def _login_net_hint(proxy_name: str, exc: Exception) -> str:
@@ -414,6 +443,48 @@ def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
     return (auth_dir or config.AUTH_DIR) / filename
 
 
+def find_auth_file_for_uid(uid: str, auth_dir: Path | None = None) -> Path | None:
+    """按 **uid** 找出该账号已经存在的凭证文件（任意合规文件名），找不到返回 None。
+
+    为什么不能只认「`workbuddy-<uid>.json` 这一个名字」：上游是按 **uid** 建池的
+    （`SyncToDir` 里 `seen[a.UID]`，同 uid 后读到的覆盖先读到的），而面板是按
+    **文件**列的。两者只有在「一个 uid 恰好一个文件」时才等价。
+
+    当目录里已经有该 uid 的另一份文件（旧版本命名、手工放进来的
+    `workbuddy_new.json` 之类），`write_auth_file` 若仍按规范名新建一份，就会
+    出现**同 uid 两份文件**：
+
+      · 面板多出一行幽灵账号（其中一行带着旧凭证，永远显示旧的失败状态）；
+      · 上游按文件名排序后只认其中一份 —— 新写的那份若排在前面，就会被后面的
+        旧文件覆盖，于是「重登成功了，凭证却还是旧的」，账号继续 401、继续被
+        系统禁用，**在重登队列里怎么都清不掉**。
+
+    这正是「同一账号在『添加账户』与『重登』两条路上表现不一致」的来源：结果
+    取决于目录里那份文件叫什么名字。写入前先按 uid 找文件，把两条路收敛成一条。
+
+    `.json.disabled`（面板的「临时停用」标记）也参与匹配，但**排在后面**：
+    在线文件优先；只有在没有在线文件时才认改名后的那份 —— 否则「重登一个被面板
+    停用的账号」会在旁边新建一份在线副本，等于绕过用户自己的停用意图。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return None
+    base = auth_dir or config.AUTH_DIR
+    if not base.is_dir():
+        return None
+    candidates = (sorted(base.glob('workbuddy*.json'))
+                  + sorted(base.glob('workbuddy*.json.disabled')))
+    for path in candidates:
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:  # noqa: BLE001 —— 坏文件不参与匹配，交给上层按规范名写
+            continue
+        acct = (raw.get('account') if isinstance(raw, dict) else None) or {}
+        if isinstance(acct, dict) and str(acct.get('uid') or '') == uid:
+            return path
+    return None
+
+
 def write_auth_file(account: dict, auth_dir: Path | None = None,
                     *, allow_overwrite: bool = True) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
@@ -438,7 +509,10 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
         raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
     base = auth_dir or config.AUTH_DIR
     base.mkdir(parents=True, exist_ok=True)
-    target = base / f'workbuddy-{uid}.json'
+    # 先找「这个 uid 已经有的那份文件」：重登/重新导入要**就地改写**，不能在旁边
+    # 再建一份规范名的新文件（同 uid 两份文件会让上游读哪份变成文件名排序的
+    # 运气问题，见 find_auth_file_for_uid 的说明）。
+    target = find_auth_file_for_uid(uid, base) or (base / f'workbuddy-{uid}.json')
     disabled_target = base / f'{target.name}.disabled'
     if not target.exists() and disabled_target.exists():
         target = disabled_target
@@ -534,6 +608,10 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     当异常来源（上游 D3 实测）。
     """
     refresh = str(auth.get('refresh_token') or '').strip()
+    if '_risk_auth_dir' in auth:
+        from . import accountrisk
+        if await accountrisk.paused(str(auth.get('uid') or ''), auth['_risk_auth_dir']):
+            return False, '账号已保护性暂停，未发送刷新请求；请先检查账号预警；限时暂停到期自动允许重试，需人工复核时使用预警中的解除暂停', {}
     if not refresh:
         return False, '该账号没有 refreshToken（只能重新扫码或登录）', {}
 
@@ -560,6 +638,13 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
         return False, f'刷新异常: {err_text(exc)}', {}
 
     if resp.status_code >= 400:
+        if resp.status_code == 429:
+            paused = False
+            if '_risk_auth_dir' in auth:
+                from . import accountrisk
+                paused = await accountrisk.pause_refresh(str(auth.get('uid') or ''), auth['_risk_auth_dir'], retry_after=_refresh_retry_after(resp))
+            return False, ('令牌刷新接口限流（HTTP 429），不是凭证失效；'
+                           + ('已保护性暂停该账号，请查看账号预警' if paused else '请查看账号预警，暂停状态尚未确认')), {}
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
         # 说清楚「该重新扫码」比让用户反复点刷新有用。
         return False, (f'刷新失败（HTTP {resp.status_code}）——'
@@ -593,6 +678,9 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     if isinstance(body.get('domain'), str) and body['domain']:
         out['domain'] = body['domain']
 
+    if '_risk_auth_dir' in auth:
+        from . import accountrisk
+        await accountrisk.note_refresh_success(uid, auth['_risk_auth_dir'])
     when = out.get('expires_at')
     if when:
         left = max(0, when - int(time.time()))
@@ -837,7 +925,8 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
             total += remain
             at = _package_expiry(item) if remain > 0 else None
             if at is not None:
-                expiries.append({'at': at, 'amount': _round_credits(remain)})
+                expiries.append({'at': at, 'amount': _round_credits(remain),
+                                'created': _package_created(item)})
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
@@ -1105,25 +1194,80 @@ def _parse_model_payload(data: object, realm: Realm) -> tuple[dict[str, dict], l
     return items, order
 
 
+# 非对话模型的 tag 白名单（剔除）。除上游已有的 `text-to-image`，这里补上
+# **视频 / 音频**这类「产出不是文本」的模型（issue #461）。
+#
+# 为什么必须剔：模型中心是给人**挑模型**的地方，而本网关只转发 chat 协议。
+# 列出 `kling-video-v3` 这种视频模型，用户选它 → 调用必然失败，且失败信息
+# 讲的是「模型不支持」，用户很难判断是网关的问题还是模型本身不能这么用。
+# 这与 `text-to-image` 是同一类问题，只是当初只想到图片。
+_NON_CHAT_TAGS = frozenset({
+    'text-to-image',
+    'text-to-video',
+    'image-to-video',
+    'image-to-image',
+    'text-to-speech',
+    'text-to-audio',
+    'video-generation',
+    'audio-generation',
+    # 保留字，防上游将来用更宽的名字
+    'video',
+    'audio',
+})
+
+# id 里出现这些**完整片段**即视为非对话模型。
+#
+# 刻意收得紧一点：只要裸的 `video` 会把「视频理解」这类**多模态对话**模型也剔掉
+# （它们能读视频、但产出仍是文本，是能用的）。所以只认「生成类」的组合形态。
+_NON_CHAT_ID_MARKERS = (
+    '-video-',          # kling-video-v3 / minimax-video-h3 这类
+    'video-gen',
+    '-tts', 'tts-',
+    'text-to-image', 'image-to-video', 'image-to-image',
+    '-audio-gen', 'audio-gen-',
+)
+# 以这些**结尾**的也剔：`hunyuan-video` 这种没有后缀版本号，上面那组片段匹配不到。
+# 单独一组而不是塞进上面，是因为「结尾」比「片段」更强——`xxx-video` 一定是视频
+# 模型，而 `video-xxx` 可能是视频理解。
+_NON_CHAT_ID_SUFFIXES = ('-video', '-tts', '-audio')
+
+
+# 明确是**多模态对话**的 id 片段：能读图/视频/音频，但产出仍是文本，是可用的。
+# 先于 `_NON_CHAT_ID_MARKERS` 判定 —— 否则 `xxx-video-understanding` 这种会被
+# 视频规则误伤。宁可漏剔一个，也别剔掉用户能用的模型。
+_CHAT_MULTIMODAL_MARKERS = ('understanding', '-vl', 'vl-', 'vision', 'multimodal', 'omni')
+
+
 def _non_chat_model(mid: str, max_output_tokens: int, tags: list) -> bool:
     """是否非对话模型（应从可选列表里剔除）。
 
-    镜像上游 nonChatModel（2026-09-14 新增，来源 harness buddy.ts:547-555）。
-    三类：
+    镜像上游 nonChatModel（2026-09-14 新增，来源 harness buddy.ts:547-555），
+    并在其上补了视频/音频（issue #461）：
       * id 前缀 `nes-` / `completion-` / `codewise-`：嵌入 / 补全 / 代码专用，
         选了会报 `code=11102`；
       * `maxOutputTokens <= 256`：输出上限过小，属 tiny 非对话模型；
-      * tags 含 `text-to-image`：图片生成，不是本网关用途。
+      * tags 命中 `_NON_CHAT_TAGS`（图片 / 视频 / 音频生成）；
+      * id 里带生成类片段（视频模型的命名没有统一前缀，见上）。
 
     为什么要跟：模型中心是给用户**挑模型**的地方，列出选不了的东西
     等于制造一次必然失败的尝试。
+
+    ⚠️ 只在国内版生效（调用方按 `realm != GLOBAL` 判定）：那套规则源自国内版
+    harness，套到国际版会重犯「用国内版口径裁剪国际版」的错误。
     """
     low = (mid or '').strip().lower()
     if low.startswith(('nes-', 'completion-', 'codewise-')):
         return True
     if 0 < max_output_tokens <= 256:
         return True
-    return any(str(t) == 'text-to-image' for t in tags)
+    if any(str(t).strip().lower() in _NON_CHAT_TAGS for t in tags):
+        return True
+    # 多模态**对话**优先放行：它们读视频/图片但产出文本，剔掉就是误伤
+    if any(marker in low for marker in _CHAT_MULTIMODAL_MARKERS):
+        return False
+    if any(low.endswith(suffix) for suffix in _NON_CHAT_ID_SUFFIXES):
+        return True
+    return any(marker in low for marker in _NON_CHAT_ID_MARKERS)
 
 
 def _as_int(v: object) -> int:
@@ -1196,6 +1340,21 @@ def _package_remain(item: dict) -> float:
 # 这里等价。
 _PACKAGE_END_LAYOUT = '%Y-%m-%d %H:%M:%S'
 _PACKAGE_END_TZ = timezone(timedelta(hours=8))
+
+
+def _package_created(item: dict) -> int:
+    """套餐到账时刻（epoch 秒）。上游 CreateTime 是毫秒时间戳。
+
+    缺失/非法/非正数返回 0，调用方据此回退「采集时刻」——不能拿 0 当 1970 年。
+    """
+    raw = item.get('CreateTime')
+    if raw is None:
+        return 0
+    try:
+        ms = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return ms // 1000 if ms > 0 else 0
 
 
 def _package_expiry(item: dict) -> int | None:

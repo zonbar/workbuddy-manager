@@ -9,13 +9,14 @@ from urllib.parse import urlsplit
 import logging
 import threading
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
-from ..services import modelcatalog, modelmap, proxyroutes
+from ..services import modelcatalog, modelmap, proxyroutes, tap as tap_svc
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -498,7 +499,10 @@ def client_channel(ua: str | None) -> str:
         return 'unknown'
     if 'codex' in text:
         return 'codex'
-    if 'claude-code' in text or 'claude code' in text:
+    if 'claude' in text or 'anthropic' in text:
+        # UA 实际有 `claude-code/…`、`claude-cli/2.0.1 (external, cli)`、
+        # `claude_cli/…` 几种写法；早先只认前两种，于是**真正的 Claude Code CLI**
+        # 在请求日志里被记成 other（轨迹页的同类守卫实测发现）。
         return 'claude-code'
     if 'deepseek' in text or 'dsh' in text:
         return 'dsh'
@@ -586,7 +590,16 @@ def normalize_chat_images(body: object) -> int:
     return changed
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None) -> None:
+def _account_expected_after_error(exc: Exception) -> bool:
+    """只排除明确未发送到上游的错误；读/写超时或协议错误可能已选账号。
+
+    ConnectError 覆盖 DNS、连接拒绝和建连失败；ConnectTimeout / PoolTimeout
+    分别发生在建连与取得连接前。不能按 502 或所有 TransportError 一刀切。
+    """
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -607,6 +620,9 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
     if credit is None:
         credit = _usage_credit(usage)
     cache_hit, cache_miss, cache_write = _usage_cache(usage)
+    # 日志与用量统计必须用**同一个时刻**（issue #380）：费用按调用时刻的价目
+    # 与峰谷档计价，两处各取一次 time.time() 会在整点/整点边界上算出两个价。
+    log_ts = int(time.time())
 
     try:
         # realm 由**实际发往上游的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
@@ -627,11 +643,12 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
         model_clean = db._clean(model, 128)
         realm = db.realm_of_model(db._clean(mapped, 128) or model_clean)
         db.add_request_log(
-            ts=int(time.time()),
+            ts=log_ts,
             key_id=key['id'] if key else None,
             ip=db._clean(ip, 64),
             model=model_clean,
             mapped_model=db._clean(mapped, 128),
+            account_expected=int(account_expected and bool(model_clean or mapped)),
             status=status,
             prompt_tokens=pt,
             completion_tokens=ct,
@@ -661,7 +678,12 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             # 原先只记 token，积分用量就永远是 0，超限判定无从谈起。
             keysvc.touch(key, ip, total, credit)
             if total or credit:
-                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm)
+                # cache 两段与时刻一并传入（issue #380）：费用要按命中价 /
+                # 未命中价、以及高峰 / 空闲两档分别计价，缺任一样就只能估成
+                # 「整段输入按未命中价」，长对话会高估好几倍。
+                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm,
+                              cache_hit=cache_hit, cache_miss=cache_miss,
+                              ts=log_ts)
         except Exception as exc:  # noqa: BLE001
             logger.warning('累计用量失败（不影响请求）: %s', exc)
 
@@ -719,7 +741,8 @@ def _authorize(request: Request, model: str | None,
     # 全局入站 IP 规则
     if _global_ip_blocked(ip):
         _log_ip(ip, path, True, ua, 'ip_blocked')
-        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False,
+                account_expected=False)
         return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
@@ -733,7 +756,8 @@ def _authorize(request: Request, model: str | None,
         # 把 401/403 统一显示成「API 密钥无效」，一律 403 会把「密钥版本不匹配」
         # 这种配置问题说成密钥坏了，用户便反复重建密钥（issue #18）。
         _record(key, ip, model or '', mapped or '',
-                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
+                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
         reject_status = getattr(reason, 'status', 403)
         return None, ip, _oai_error(
@@ -747,7 +771,8 @@ def _authorize(request: Request, model: str | None,
     limited, count = _rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
-        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded',
                                     retry_after=RATE_WINDOW)
@@ -845,7 +870,8 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
     try:
         return upstreamsvc.resolve_for_key(key), None
     except upstreamsvc.UpstreamUnavailable as exc:
-        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False,
+                account_expected=False)
         # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
         # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
         # 是哪个分组、该启用还是改绑）。
@@ -919,13 +945,25 @@ def key_usage(request: Request):
         _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
         return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
-    def allowance(limit: int | None, used: int | None) -> dict:
-        used_n = int(used or 0)
-        limit_n = int(limit or 0)
+    def allowance(limit, used, *, integral: bool = True) -> dict:
+        """额度三元组。**积分是小数、token 是整数**，必须分开处理（issue #450）。
+
+        历史上这里对两者都用 `int()`：`quota_credit=0.5`、`used_credit=0.04`
+        被截成 `int(0.5)=0` / `int(0.04)=0`，于是 limit 变成 None（被当成「不限」）、
+        used 恒为 0 —— 面板上明明有额度与消耗，`/v1/usage` 却一路报空。
+        """
+        if integral:
+            used_n: int | float = int(used or 0)
+            limit_n: int | float = int(limit or 0)
+        else:
+            used_n = round(float(used or 0), 6)
+            limit_n = round(float(limit or 0), 6)
         return {
             'used': used_n,
             'limit': limit_n or None,          # None = 不限制
-            'remaining': max(0, limit_n - used_n) if limit_n else None,
+            'remaining': (max(0, limit_n - used_n) if limit_n else None)
+                         if integral else
+                         (round(max(0.0, limit_n - used_n), 6) if limit_n else None),
         }
 
     now = int(time.time())
@@ -947,7 +985,10 @@ def key_usage(request: Request):
             'models': list(key.get('models') or []),
         },
         'tokens': allowance(key.get('quota'), key.get('used_tokens')),
-        'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        # 积分是**小数**（0.04 这类），按整数转型会被截成 0（issue #450）
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit'), integral=False),
+        # 今日 token（本地日期，次日 0 点恢复）；limit 为 None = 不限
+        'daily_tokens': allowance(key.get('daily_quota'), key.get('daily_used_tokens')),
         'last_used_at': int(key.get('last_used_at') or 0),
         # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
         'snapshot_at': now,
@@ -985,6 +1026,8 @@ async def list_models(request: Request):
         # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
         # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
         payload = _listing_compat_models(payload)
+        # 国内版 id 去掉 `cn:` 前缀，与模型中心显示的名字一致（裸名 = 国内版）。
+        payload = _bare_cn_model_ids(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -1108,7 +1151,7 @@ def _filter_catalog_models(payload: object, key: dict | None,
         if not isinstance(m, dict) or not m.get('id'):
             kept.append(m)
             continue
-        if _model_realm_of(m) != realm:
+        if realm and _model_realm_of(m) != realm:
             kept.append(m)
             continue
         mid = _catalog_model_key(m.get('id'))
@@ -1127,17 +1170,23 @@ async def _drop_models_outside_catalog(payload: object, key: dict | None) -> obj
     if not isinstance(payload, dict):
         return payload
     realm = keysvc._norm_realm((key or {}).get('realm'))
-    if realm not in ('cn', 'global'):
+    # 未限定版本的密钥同样要裁（issue #407）：它看到的是上游全部条目，下架模型
+    # 混在里面，客户端选中才失败。两个版本的目录都取到「腾讯直连」这一权威来源时
+    # 取并集比对；任一版本取不到就不裁，避免把另一版的模型误删。
+    realms = [realm] if realm in ('cn', 'global') else ['cn', 'global']
+    ids: set[str] = set()
+    for r in realms:
+        try:
+            cat = await asyncio.wait_for(modelcatalog.catalog(r), timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('模型目录裁剪跳过：%s', exc)
+            return payload
+        if cat.get('source') != 'tencent':
+            return payload
+        ids |= {_catalog_model_key(m.get('id')) for m in (cat.get('models') or [])
+                if isinstance(m, dict) and m.get('id')}
+    if not ids:
         return payload
-    try:
-        cat = await asyncio.wait_for(modelcatalog.catalog(realm), timeout=5)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug('模型目录裁剪跳过：%s', exc)
-        return payload
-    if cat.get('source') != 'tencent':
-        return payload
-    ids = {_catalog_model_key(m.get('id')) for m in (cat.get('models') or [])
-           if isinstance(m, dict) and m.get('id')}
     return _filter_catalog_models(payload, key, realm, ids)
 
 
@@ -1175,6 +1224,43 @@ def _scope_models(payload: object, key: dict | None) -> object:
     # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
     scoped += _alias_entries(in_realm, allow)
     return {**payload, 'data': scoped}
+
+
+def _bare_cn_model_ids(payload: object) -> object:
+    """`/v1/models` 里国内版模型的 id 去掉 `cn:` 前缀，**保留 `global:`**。
+
+    模型中心早已只显示腾讯自带的裸名（`deepseek-v4.1-flash`），但网关的
+    `/v1/models` 仍原样透出上游的 `cn:deepseek-v4.1-flash`：用户在面板上看到
+    的名字和客户端拉到的名字对不上。更实际的问题是 Cherry Studio 等客户端按
+    模型 id 识别推理档位 / 多模态等能力，`cn:xxx` 认不出，推理档位选项直接不出现。
+
+    口径与 `keysvc._bare_model` 一致：上游 `resolveModel` 把裸名当国内版，所以
+    去 `cn:` 安全；`global:` 去掉会被路由到国内账号池，绝不能动。带 `cn:` 的
+    旧调用不受影响（调用侧照旧接受两种写法，白名单也两种都认）。
+
+    去前缀后若与已有条目同名（上游同时列了裸名与 `cn:` 名），只保留一条，
+    取字段更全的那条，免得客户端里出现两个一样的模型。认不出的结构原样透传。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    index: dict[str, int] = {}
+    for m in items:
+        if not isinstance(m, dict) or not isinstance(m.get('id'), str) or not m['id']:
+            out.append(m)
+            continue
+        mid = keysvc._bare_model(m['id'])
+        entry = m if mid == m['id'] else {**m, 'id': mid}
+        if mid in index:
+            if len(entry) > len(out[index[mid]]):
+                out[index[mid]] = entry
+            continue
+        index[mid] = len(out)
+        out.append(entry)
+    return {**payload, 'data': out}
 
 
 def _listing_compat_models(payload: object) -> object:
@@ -1227,6 +1313,11 @@ async def _chat(request: Request, upstream_path: str):
     body, err = await _read_json_body(request)
     if err:
         return err
+    # 客户端原样发出的那份请求体：**在任何改写之前**深拷贝。
+    # 后面的模型映射、max_tokens 钳制、图片归一、stream_options 注入都会就地
+    # 改动 `body`，改完就再也拿不到「客户端到底发了什么」——而抓包页的
+    # 「客户端视角」正是要看这一份，和网关改写后的那份对着看。
+    client_body = tap_svc.snapshot(body)
 
     requested_model = body.get('model') if isinstance(body, dict) else None
     # model 必须是字符串：非字符串（对象/数组/数字）会让后面的 _map_model 与
@@ -1273,12 +1364,22 @@ async def _chat(request: Request, upstream_path: str):
     if upstream_err:
         return upstream_err
     url = f'{upstream["base_url"]}{upstream_path}'
+    # 转发头只构造一次：既给 httpx，也给抓包（「网关发了什么请求头」是双视角的
+    # 一半，另一处再造一份就可能与真正发出去的不一致）。
+    up_headers = _upstream_headers(upstream)
+    # 关联键：上游开启出站转储后，会把「它发往腾讯」的请求 / 响应按这个头落两行，
+    # 管理端的「腾讯视角」据此精确对回这一轮（不靠时间窗猜）。
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=body, headers=_upstream_headers(upstream))
+                resp = await client.post(url, json=body, headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage = {}
             try:
@@ -1300,6 +1401,15 @@ async def _chat(request: Request, upstream_path: str):
                 key, ip, requested_model or '', mapped or '', rec_status, pt, ct,
                 latency, ua, error, False, usage=usage, effort=effort,
             )
+            # 抓包（Trace Tap）：在记账之后、响应返回之前落库。放在这里而不是
+            # 转发之前，是因为非流式要拿到完整响应体才算「这一轮到底回了什么」。
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=rec_status,
+                latency_ms=latency, stream=False, payload=data, usage=usage,
+                error=error, upstream_body=body, upstream_headers=up_headers,
+                trace_id=trace_id,
+            )
             if missing is not None:
                 return JSONResponse(missing, status_code=404)
             retry_after = None
@@ -1312,18 +1422,26 @@ async def _chat(request: Request, upstream_path: str):
                                 status_code=resp.status_code, headers=headers)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                    account_expected=_account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=502, latency_ms=latency,
+                stream=False, error=str(exc), upstream_body=body,
+                upstream_headers=up_headers, trace_id=trace_id,
+            )
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=body, headers=_upstream_headers(upstream))
+        req = client.build_request('POST', url, json=body, headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort)
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort,
+                account_expected=_account_expected_after_error(exc))
         return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
@@ -1355,6 +1473,10 @@ async def _chat(request: Request, upstream_path: str):
         return JSONResponse({'error': {'message': text[:1000], 'type': 'api_error'}},
                             status_code=status_code, headers=headers)
 
+    # 抓包用的原始流缓冲。与 `pending` 分开：`pending` 会被 _scan_sse 消费掉
+    # （它只保留残缺的最后一行），照它入库会丢掉前面所有数据帧。
+    raw_stream = tap_svc.RawStream()
+
     async def generator():
         usage: dict = {}
         pending = ''
@@ -1364,8 +1486,10 @@ async def _chat(request: Request, upstream_path: str):
         first_token_ms: int | None = None
         try:
             async for chunk in resp.aiter_bytes():
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
                 if status_code >= 400:
-                    pending += chunk.decode('utf-8', errors='ignore')
+                    pending += piece
                     # 有数据就留一份：早先要等到 4000 字节才取，而上游的错误体
                     # 通常只有几百字节 → error_text 恒为空，**错误被静默丢弃**：
                     # 客户端看得到（原样透传），管理端日志却什么都不记，用户来问
@@ -1374,7 +1498,7 @@ async def _chat(request: Request, upstream_path: str):
                         error_text = pending[:500]
                     yield chunk
                     continue
-                pending += chunk.decode('utf-8', errors='ignore')
+                pending += piece
                 pending, saw_content = _scan_sse(pending, usage)
                 if saw_content and first_token_ms is None:
                     first_token_ms = int((time.time() - started) * 1000)
@@ -1389,6 +1513,13 @@ async def _chat(request: Request, upstream_path: str):
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
                 first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=status_code,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)
@@ -1420,3 +1551,143 @@ async def gateway_health() -> dict:
     except Exception:  # noqa: BLE001
         # 不回异常详情：那会暴露上游地址与网络拓扑
         return {'service': 'workbuddy-manager', 'upstream_ok': False}
+
+
+# ── agenttool web search 透传（/v1/tools/search）────────────────
+# 把下游的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
+# （workbuddy2api 0057-web-search-tool.patch：账号池轮转 + 15001 配额冷却）。
+#
+# 为什么加这条路由：DSH 的 web-search-workbuddy 插件用**同一把密钥**既调模型
+# （/v1/chat/completions）又调搜索——密钥体系一把钥匙走全部数据面，搜索不该
+# 另立凭证。manager 在这里只做：鉴权（_authorize）→ 按密钥解析上游
+# （_upstream_for，多分组隔离语义与 chat 一致）→ 换上游 api_key 转发 → 记账。
+#
+# 协议是「透传」不是「翻译」：上游的信封（code/results/total_results/…）原样
+# 回给客户端，非 15001 的业务码也原样透传——过滤语义由调用方决定（与 chat 的
+# error-passthrough 同哲学）。请求体同理：只校验已知参数，不改写、不删字段，
+# 未知字段也原样放行（兼容后续 agenttool 参数扩展）。
+SEARCH_UPSTREAM_PATH = '/v1/tools/search'
+
+# agenttool/v1/search 支持的全部可选参数（0057 网关 toolSearchRequest 同款）。
+# freshness：d1=一天内 / m1=一月内 / y1=一年内；空串等同不传。
+SEARCH_FRESHNESS_VALUES = ('', 'd1', 'm1', 'y1')
+SEARCH_MAX_RESULTS_BOUND = 20
+
+
+def _validate_search_params(body: object) -> str | None:
+    """校验 /v1/tools/search 的入站参数，返回错误描述；None 表示合法。
+
+    只校验、不改写 body：校验通过后 body 原样转发给 0057 网关，由网关负责
+    max_results 兜底、blocked_domains 拼 `-site:` 进 query、以及 agenttool
+    上游请求体的组装。非法参数在 manager 层早失败，不消耗账号池搜索配额。
+    """
+    if not isinstance(body, dict):
+        return '请求体必须是 JSON 对象'
+    if not isinstance(body.get('query'), str):
+        return 'query 必须是字符串'
+    if 'type' in body and body['type'] != 'text2text':
+        return 'type 必须是 "text2text"'
+    if 'max_results' in body:
+        value = body['max_results']
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= SEARCH_MAX_RESULTS_BOUND:
+            return f'max_results 必须是 1..{SEARCH_MAX_RESULTS_BOUND} 的整数'
+    for key in ('allowed_domains', 'blocked_domains'):
+        if key in body:
+            value = body[key]
+            if not isinstance(value, list) or any(not isinstance(d, str) for d in value):
+                return f'{key} 必须是字符串数组'
+    if 'freshness' in body:
+        value = body['freshness']
+        if not isinstance(value, str) or value not in SEARCH_FRESHNESS_VALUES:
+            return 'freshness 必须是 d1 | m1 | y1'
+    return None
+
+
+@router.post('/v1/tools/search')
+async def tools_search(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度，
+    # 因此走 is_model_list=True 口径（与 /v1/models 同理）：版本归属与模型白名单
+    # 在这种「不带 model 的数据面调用」上不拦——拦了会让限定版本的密钥连搜索都
+    # 用不了；真正的隔离由上游网关的账号池把关（realm 由上游按账号侧决定）。
+    key, ip, err = _authorize(request, None, is_model_list=True)
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是合法 JSON', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    if not isinstance(body, dict):
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是 JSON 对象', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    query = str(body.get('query') or '').strip()
+    if not isinstance(body.get('query'), str) or not query:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空或非字符串', False,
+                account_expected=False)
+        return _oai_error('query 不能为空且必须是字符串', 400, 'invalid_request_error', 'empty_query')
+
+    # agenttool 全参数入站校验（type / max_results / allowed_domains /
+    # blocked_domains / freshness）。合法 body 原样转发，不重命名、不删字段。
+    param_error = _validate_search_params(body)
+    if param_error:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, f'搜索参数非法: {param_error}', False,
+                account_expected=False)
+        return _oai_error(param_error, 400, 'invalid_request_error', 'invalid_search_params')
+
+    upstream, upstream_err = _upstream_for(key, ip=ip, model='', mapped='', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{SEARCH_UPSTREAM_PATH}'
+    up_headers = _upstream_headers(upstream)
+    # 出站转储关联键：与 chat 同协议（上游开启转储后按它落两行，双视角对回）。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
+
+    started = time.time()
+    try:
+        async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+            resp = await client.post(url, json=body, headers=up_headers)
+        latency = int((time.time() - started) * 1000)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            data = None
+        # 记账：搜索没有 token 计量（上游 agenttool 不回 usage），0/0 与
+        # /v1/models、/v1/usage 的口径一致；错误时透传上游原文前 500 字。
+        error = None if resp.status_code < 400 else (
+            str(data)[:500] if data is not None else resp.text[:500])
+        # 客户端语义化：全池 15001 时上游网关回 429 + quota_web_search，
+        # 原样透传（客户端按 code 路由提示语）。
+        _record(key, ip, '', '', resp.status_code, 0, 0, latency, ua, error, False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=resp.status_code,
+            latency_ms=latency, stream=False, payload=data,
+            error=error, upstream_body=body, upstream_headers=up_headers,
+            trace_id=trace_id,
+        )
+        if data is not None:
+            return JSONResponse(data, status_code=resp.status_code)
+        return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                            status_code=resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        latency = int((time.time() - started) * 1000)
+        _record(key, ip, '', '', 502, 0, 0, latency, ua, str(exc), False,
+                account_expected=False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=502,
+            latency_ms=latency, stream=False, error=str(exc),
+            upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
+        )
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502,
+                          'api_error', 'upstream_unavailable')

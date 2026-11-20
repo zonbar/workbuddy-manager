@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 from .. import db, upstreamsvc
-from . import taskrun
+from . import taskrun, taskpacing
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,26 @@ def set_plan(body: object) -> dict:
             raise ValueError(f'{t}.hour 必须是 0-23 的整点')
         plan[t]['enabled'] = enabled
         plan[t]['hour'] = hour
+    db.set_setting(_KEY, plan)
+    return plan
+
+
+# 与上游调度器**重叠**的任务：签到（上游 checkin）与领取补偿（上游 activity
+# 内部会领）。领奖 / 做任务上游没有，属于面板独占，不参与「只保留一套」。
+OVERLAP_TASKS = ('checkin', 'compensation')
+
+
+def set_overlap_enabled(enabled: bool) -> dict:
+    """统一开关重叠任务（issue #375：上游与面板两套调度二选一）。
+
+    只动 checkin / compensation，保留时刻与 last_run；claim / full 不受影响。
+    非布尔值直接拒绝，避免把 'false' 写进库后 is_due 按真值判断。
+    """
+    if not isinstance(enabled, bool):
+        raise TypeError('enabled 必须是布尔值')
+    plan = get_plan()
+    for task in OVERLAP_TASKS:
+        plan[task]['enabled'] = enabled
     db.set_setting(_KEY, plan)
     return plan
 
@@ -232,7 +252,10 @@ async def run_task(task: str) -> tuple[bool, str]:
     mode = 'claim' if task == 'claim' else 'full'
     results: list[str] = []
     ok_all = True
+    group_pacer = taskpacing.AccountPacer(mode)
     for g in groups:
+        # Scripts pace accounts within a group; keep a gap between groups too.
+        await group_pacer.wait()
         ok, msg = await taskrun.start_async(
             mode, 'ALL', auth_dir=g.get('auth_dir'), group_name=str(g.get('name') or ''),
         )
@@ -260,7 +283,8 @@ async def _loop() -> None:
                     continue
                 logger.info('每日任务触发：%s（%s 点档）', task, plan[task]['hour'])
                 try:
-                    ok, msg = await run_task(task)
+                    with taskpacing.scheduled_execution():
+                        ok, msg = await run_task(task)
                     logger.info('每日任务 %s：ok=%s %s', task, ok, msg)
                 except Exception as exc:  # noqa: BLE001
                     # 单个任务出错不该拖垮整轮巡检（下一个任务照常判）

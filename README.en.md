@@ -105,6 +105,9 @@ upstream repo is gone, and its source is now maintained here.
 - **Multiple upstreams** — configure several instances, each with its own address and `api_key`
 - **Security** — inbound IP allow / deny lists (CIDR), audit log, separate session and API tokens
 - **Updates & backup** — one-click update (checksum-verified), off-site PostgreSQL backup
+- **Traces (call capture)** — replay the full context of every call; switch between client
+  and gateway perspectives to see what the gateway rewrote, diff a turn against the previous
+  one block by block, and export a single-file HTML
 - **Five locales** — Simplified / Traditional Chinese, English, Japanese, Korean
 
 The exhaustive list (with detail per item) lives in [the full feature list](docs/features.md).
@@ -128,6 +131,27 @@ Usage: daily / hourly, failures and latency
 <img src="docs/images/logs.png" alt="Request logs" width="100%" />
 
 Request logs: model, status, TTFB and billing per call
+
+<img src="docs/images/traces.png" alt="Traces (call capture)" width="100%" />
+
+Traces: every turn of one agent task, with client name and version, context size and tool list
+
+<details>
+<summary><b>Client vs gateway perspective, and diff with the previous turn</b> (click to expand)</summary>
+
+<img src="docs/images/traces-headers-client.png" alt="Client perspective: headers and body exactly as the client sent them" width="100%" />
+
+Client perspective: headers and body **exactly as sent** by the client (credentials masked, first 6 characters kept)
+
+<img src="docs/images/traces-headers-gateway.png" alt="Gateway perspective: what the gateway actually sent upstream" width="100%" />
+
+Gateway perspective: what the gateway sent upstream after rewriting, with the rewritten fields listed on top
+
+<img src="docs/images/traces-diff.png" alt="Diff against the previous turn" width="100%" />
+
+Diff against the previous turn: added and changed messages, plus parameter, system-prompt and tool changes
+
+</details>
 
 More screenshots: [full gallery](docs/screenshots.md).
 
@@ -186,6 +210,9 @@ in [the usage guide](docs/usage.md).
 | `POST` | `/v1/messages/count_tokens` | gateway key | Rough input-token estimate (by character count) |
 | `GET` | `/v1/models` | gateway key | Model list |
 | `GET` | `/v1/usage` | gateway key | Self-check for one key: used / remaining quota, expiry, model scope (reads panel records; makes no call) |
+| `GET` | `/api/usage/token/` | gateway key | Balance protocol: remaining quota for the current key (new-api balance panels) |
+| `GET` | `/api/status` | none | Public balance metadata: declares the unit only, never the amount |
+| `GET` | `/api/upstream/status` | session | Upstream runtime status (moved from `/api/status`) |
 | `GET` | `/healthz` | none | Liveness probe (includes upstream connectivity) |
 | `GET` | `/api/me` | session | Current user |
 | `POST` | `/api/login` `/api/logout` | none | Sign in / out |
@@ -220,11 +247,18 @@ Threat model and hardening notes: [security notes](docs/security-notes.md) and t
 
 ## Known limitations
 
-- **No outbound IP pool**: only **inbound** IP control is implemented. Binding a dedicated
-  egress IP / proxy per Tencent account would require proxy-pool support in the upstream Go
-  service and is out of scope here.
-- Request and response **bodies are not stored** — only metadata (model, status, tokens,
-  latency, source), to protect privacy.
+- **Per-account egress routes**: the panel can bind a named HTTP/HTTPS proxy per account.
+  Chat and upstream background tasks also require matching support in workbuddy2api;
+  configuration and compatibility are covered in [account proxy routes](docs/account-proxy-routes.md).
+- **Image generation is not supported**: the gateway only bridges chat / Responses / Messages
+  and does not expose `/v1/images/generations`. A model's `supports_images` flag means **image
+  input**, not image generation; the official app's canvas/image flow is a separate path with
+  no proxy equivalent.
+- Request and response **bodies are not stored by default** — only metadata (model, status, tokens,
+  latency, source), to protect privacy. When you need to answer "why did
+  the model say that", turn on capture under Traces in the dock: content stays on this machine,
+  credentials are redacted first, and records expire on the retention window
+  (see [request traces](docs/api-traffic-tap.md)).
 - Usage is aggregated per day × key × model; hourly granularity would require extending the
   `usage_daily` table.
 
@@ -240,6 +274,8 @@ Threat model and hardening notes: [security notes](docs/security-notes.md) and t
 - [Deployment guide](deploy/README.md) — reverse proxy, HTTPS, Windows, updates
 - [Account proxy routes](docs/account-proxy-routes.md) — per-account egress
 - [API tokens](docs/api-tokens.md) — read-only tokens and scopes
+- [Request traces](docs/api-traffic-tap.md) — replay the full context of every call
+- [Web search passthrough](docs/web-search-passthrough.md) — `/v1/tools/search` usage and upstream patch requirement
 - [Page watchdog](docs/watchdog.md) — upstream page change detection, LLM triage, email / QQ alerts
 - [QQ notifications & open API](docs/qq-bot.md) — AstrBot integration, UMO, bot control boundaries
 

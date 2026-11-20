@@ -7,8 +7,12 @@ import type {
   AccountsResponse,
   RefreshPlan,
   DailyPlan,
+  TaskSchedulerStatus,
+  TaskSchedulerApply,
   DailyTask,
   CreditsFlow,
+  AccountUsageResponse,
+  AccountModelUsageResponse,
   ApiKey,
   ApiToken,
   AuditLogPage,
@@ -30,6 +34,7 @@ import type {
   AutoUpdateConfig,
   AutoUpdateInfo,
   GithubMirror,
+  GatewayCors,
   IpAccessLog,
   IpRule,
   KeyExportResult,
@@ -38,6 +43,7 @@ import type {
   KeyImportStatus,
   Me,
   ModelCatalog,
+  PricingInfo,
   ModelListResponse,
   Page,
   PgSyncConfig,
@@ -54,6 +60,12 @@ import type {
   RequestLog,
   SecurityConfig,
   StatsSummary,
+  StatsRealtime,
+  TapConfigResponse,
+  TapDiff,
+  TapSession,
+  TapSessionDetail,
+  TapTurn,
   TaskLogResponse,
   TaskRunStatus,
   UpdateCheck,
@@ -179,6 +191,41 @@ export const authApi = {
 const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
+export interface AccountRiskEvent {
+  id: string; uid: string; nickname: string; group: string; realm: string;
+  operation: string; http_status: number; ts: number; historical: boolean;
+  acknowledged: boolean; paused: boolean | null; action_error: string;
+  pause_until: number; needs_review: boolean; failures: number;
+}
+
+export const accountRiskApi = {
+  list: (realm: string, upstreamId: number | null = null, allGroups = false, includeAcknowledged = false) =>
+    get<{items: AccountRiskEvent[]; failed_groups: string[]; total: number}>('/api/account-risk',
+      {realm, upstream_id: upstreamId ?? undefined, all_groups: allGroups, include_acknowledged: includeAcknowledged}),
+  resume: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/resume`),
+  acknowledge: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/acknowledge`),
+};
+
+/**
+ * `POST /api/auth/start` 的响应。
+ *
+ * `target` 只有**重登**（请求里带了 `uid`）时才有：后端据此回显「这次到底在给
+ * 哪个账号换凭证」，界面拿它显示标题与版本，并在扫错号时继续显示目标是谁。
+ */
+export interface AuthStartResult {
+  state: string;
+  authUrl: string;
+  realm: Realm;
+  target?: {
+    uid: string;
+    nickname: string;
+    realm: Realm;
+    file: string;
+    /** 面板里被「临时停用」：重登只刷凭证，不会自动启用它 */
+    panel_disabled: boolean;
+  };
+}
+
 export const accountApi = {
   proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
   /** 上游「账号管理接口」（admin.enabled）开关状态；供解禁队列判断能否真的解封。
@@ -206,6 +253,16 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  /**
+   * 本分组的自定义顺序（拖拽排序）。
+   *
+   * 顺序存在服务端而不是浏览器里：它是这份部署的**共享视图**，换设备 / 换浏览器
+   * 打开要看到同一份顺序。它只是展示顺序，不影响上游选号或任何一次调用的结果。
+   */
+  order: (upstreamId?: number | null) =>
+    get<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId)),
+  saveOrder: (order: string[], upstreamId?: number | null) =>
+    put<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId), {order}),
   exportZip: async (upstreamId?: number | null) => {
     const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
       responseType: 'blob',
@@ -235,13 +292,21 @@ export const accountApi = {
    * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
    * 总是当前这张码对应的地区。
    */
-  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string, proxy?: string) =>
-    post<{state: string; authUrl: string; realm: Realm}>(
-      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy}),
+  /**
+   * 发起扫码登录。
+   *
+   * `uid` 非空 = **重登这个账号**（见后端 `auth_start` 的说明）：版本会跟随该
+   * 账号、扫到的账号必须就是它、落盘就地写它已有的那份文件。不传 = 添加新账号。
+   */
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string,
+          proxy?: string, uid?: string) =>
+    post<AuthStartResult>(
+      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy, uid}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
   poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{
-      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch';
+      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch'
+        | 'account_mismatch';
       uid?: string;
       nickname?: string;
       updated?: boolean;
@@ -249,6 +314,21 @@ export const accountApi = {
       region_note?: string;
       expected?: Realm;
       got?: Realm;
+      /** account_mismatch：要重登的是谁、扫到的又是谁 */
+      expected_uid?: string;
+      expected_name?: string;
+      /**
+       * 重登成功后**当场**解除上游系统禁用的结果。没有这个字段 = 不是重登。
+       * `ok=false` 时 `message` 就是要给用户看的原因（管理接口没开 / api_key
+       * 不对 / 账号被封禁）；`pending=true` = 还在后台尝试。
+       */
+      revive?: {
+        attempted: boolean;
+        ok: boolean;
+        still_disabled?: boolean | null;
+        pending?: boolean;
+        message?: string;
+      };
     }>('/api/auth/poll', {state, realm, region, upstream_id: upstreamId ?? undefined}),
   remove: (file: string, upstreamId?: number | null) =>
     del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}${groupQs(upstreamId)}`),
@@ -290,7 +370,7 @@ export const accountApi = {
        upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
-  refreshCredits: (force = true, upstreamId?: number | null) =>
+  refreshCredits: (force = true, upstreamId?: number | null, file?: string) =>
     post<{
       total: number;
       succeeded: number;
@@ -298,7 +378,9 @@ export const accountApi = {
       meta: Record<string, CreditsMeta>;
       failed: string[];
     }>('/api/accounts/refresh-credits?force=' + (force ? 'true' : 'false')
-       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)),
+       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)
+       // 单账号刷新（issue #432）：给了文件名就只刷这一个号
+       + (file ? `&file=${encodeURIComponent(file)}` : '')),
   checkinAll: (upstreamId?: number | null) =>
     post<{
       /**
@@ -361,6 +443,11 @@ export const accountApi = {
   dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
   saveDailyPlan: (plan: DailyPlan) =>
     put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 上游与面板两套调度的重叠状态（issue #375） */
+  taskScheduler: () => get<TaskSchedulerStatus>('/api/accounts/task-scheduler'),
+  /** 只保留一套调度；panel 会写上游 config 并触发重载 */
+  keepTaskScheduler: (keep: 'upstream' | 'panel') =>
+    put<TaskSchedulerApply>('/api/accounts/task-scheduler', {keep}),
   /** 立即执行一次某个每日任务（不等定时） */
   runDailyTask: (task: DailyTask) =>
     post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
@@ -425,7 +512,7 @@ export const accountApi = {
 export const upstreamApi = {
   /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
   status: (upstreamId?: number | null) =>
-    get<UpstreamStatus>('/api/status',
+    get<UpstreamStatus>('/api/upstream/status',
                         upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),
@@ -483,6 +570,15 @@ export const keyApi = {
   update: (id: number, body: Partial<ApiKey>) => patch<ApiKey>(`/api/keys/${id}`, body),
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),
+  /**
+   * 取回一把已创建密钥的明文（「再复制一次」）。
+   *
+   * 面板现在把明文也存了一份（只为这一下；网关校验仍走哈希）。这条接口要求
+   * **会话管理员**，且每次调用都写一条审计日志——列表只回前缀，只能在这里拿。
+   * 存量密钥（保存明文之前的版本）回 409，界面据此提示「需要重新建一把」。
+   */
+  reveal: (id: number) => post<{id: number; name: string; prefix: string; key: string}>(
+    `/api/keys/${id}/reveal`),
   /**
    * 检查模型白名单里哪些名字匹配不到已知模型（issue #46）。
    *
@@ -616,11 +712,45 @@ export const logApi = {
   accountBackfill: () => get<AccountBackfillInfo>('/api/logs/account-backfill'),
 };
 
+/* ── 调用抓包（Trace Tap）───────────────────────────── */
+export const tapApi = {
+  config: () => get<TapConfigResponse>('/api/tap/config'),
+  saveConfig: (
+    body: Partial<{enabled: boolean; max_body: number; retention_days: number; max_sessions: number}>,
+  ) => put<TapConfigResponse>('/api/tap/config', body),
+  prune: () => post<{turns: number; stats: TapConfigResponse['stats']}>('/api/tap/prune'),
+  sessions: (params: Record<string, unknown>) =>
+    get<{total: number; items: TapSession[]}>('/api/tap/sessions', params),
+  /** 触发一次历史重算：按库里已有的 UA 重新归类、并把辅助调用挂回主会话。 */
+  backfill: () => post<{changed: number; aux: number}>('/api/tap/backfill'),
+  session: (id: number) => get<TapSessionDetail>(`/api/tap/sessions/${id}`),
+  remove: (id: number) => del<{ok: boolean}>(`/api/tap/sessions/${id}`),
+  turn: (id: number) => get<TapTurn>(`/api/tap/turns/${id}`),
+  diff: (before: number, after: number) =>
+    get<TapDiff>('/api/tap/diff', {before, after}),
+  clear: () => post<{ok: boolean; turns: number}>('/api/tap/clear'),
+  /**
+   * 导出自包含 HTML 的地址。
+   *
+   * 走浏览器原生下载（而不是 axios 取文本再拼 Blob）：附件带
+   * `Content-Disposition`，由浏览器决定落在哪里，也不会把几十 KB 的 HTML
+   * 塞进前端内存再拼一遍。带 BASE_PATH —— 子路径部署时裸路径会 404。
+   */
+  exportUrl: (id: number) => `${BASE_PATH}/api/tap/sessions/${id}/export`,
+};
+
 /* ── 用量统计 ───────────────────────────────────────── */
+/** 自定义日期范围（issue #257）：两端都含；与 days 同时传时后端优先用日期。 */
+export interface StatsRange {
+  start?: string;
+  end?: string;
+}
+
 export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
-  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  daily: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsagePoint[]>('/api/stats/daily', {days, realm, ...range}),
   /**
    * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
    * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
@@ -629,12 +759,18 @@ export const statsApi = {
     get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
 
   /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
-  creditsFlow: (days = 30, realm?: Realm) =>
-    get<CreditsFlow>('/api/stats/credits', {days, realm}),
-  byModel: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
-  byKey: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  creditsFlow: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm, ...range}),
+  byModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm, ...range}),
+  byKey: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm, ...range}),
+  /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
+  byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
+  /** 按「账号 × 模型」聚合（issue #369） */
+  byAccountModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountModelUsageResponse>('/api/stats/by-account-model', {days, realm, ...range}),
   /**
    * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
    * 且是自上游进程启动以来的累计（没有时段概念）。
@@ -647,6 +783,14 @@ export const statsApi = {
     ),
   repairUsage: () =>
     post<{repaired: number; requests: number; tokens: number}>('/api/stats/repair-usage'),
+  /**
+   * 实时并发 / RPM / 近 3 分钟走势。
+   *
+   * 与上面那些「按天聚合」的不是一回事：`inflight`/`capacity` 是**此刻**的瞬时值
+   * （来自上游 /status），`rpm_*`/`peaks`/`series` 来自本库、只含已完成请求。所以
+   * 它们的刷新节奏也不同（界面每 1 秒拉一次），也不跟 `range` 自定义区间走。
+   */
+  realtime: (days = 1) => get<StatsRealtime>('/api/stats/realtime', {days}),
 };
 
 /* ── 安全 / IP ──────────────────────────────────────── */
@@ -713,6 +857,11 @@ export const settingsApi = {
   /** 立即重启上游（一般无需手动调用，保存配置会自动重载） */
   reloadUpstream: () =>
     post<{ok: boolean; message: string}>('/api/settings/upstash/reload'),
+  /** 计费价目表（issue #380）：版本、生效档、覆盖情况、节假日缺口 */
+  pricing: () => get<PricingInfo>('/api/settings/pricing'),
+  /** 保存覆盖价目；传 null 恢复成随版本分发的那份 */
+  savePricing: (body: Record<string, unknown> | null) =>
+    put<PricingInfo>('/api/settings/pricing', body),
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),
@@ -789,6 +938,10 @@ export const systemApi = {
   githubMirror: () => get<GithubMirror>('/api/settings/github-mirror'),
   saveGithubMirror: (mirror: string) =>
     put<GithubMirror>('/api/settings/github-mirror', {mirror}),
+  /** 网关数据面 CORS（issue #445）：给浏览器里的前端页面直连 `/v1` 用 */
+  gatewayCors: () => get<GatewayCors>('/api/settings/gateway-cors'),
+  saveGatewayCors: (body: Partial<Pick<GatewayCors, 'enabled' | 'origins' | 'max_age'>>) =>
+    put<GatewayCors>('/api/settings/gateway-cors', body),
   /** 自动更新：定时检测，在时间窗内自动执行一键更新 */
   autoUpdate: () => get<AutoUpdateInfo>('/api/settings/auto-update'),
   saveAutoUpdate: (cfg: AutoUpdateConfig) =>

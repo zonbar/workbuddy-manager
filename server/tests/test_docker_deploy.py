@@ -162,11 +162,31 @@ class RestartBehaviorTest(unittest.TestCase):
             def log(self, m, level='info'): self.lines.append((level, m))
 
         with mock.patch.object(mod.os, 'kill',
-                               side_effect=lambda pid, sig: killed.append((pid, sig))), \
-                mock.patch.object(mod.time, 'sleep'):
+                               side_effect=lambda pid, sig: killed.append((pid, sig))),                 mock.patch.object(mod, '_pid1_alive', return_value=False),                 mock.patch.object(mod.time, 'sleep'):
             mod._exit_for_restart(Rep())
         self.assertEqual(killed, [(1, _signal.SIGTERM)],
                          f'应向 PID 1 发 SIGTERM，实际：{killed}')
+
+    def test_exit_for_restart_waits_for_pid1(self) -> None:
+        """发完 SIGTERM 要确认 PID 1 真的退出，不能固定睡 2 秒就走（issue #398）。
+
+        旧实现的固定 sleep 在 uvicorn 卡住优雅关闭时会让容器既不退也不重启，
+        用户看到更新后 502；这里钉住「等」和「超时强杀」两个行为。
+        """
+        import signal as _signal
+        mod = _load_update_mod(WB_RUN_MODE='docker')
+        killed: list[tuple[int, int]] = []
+
+        class Rep:
+            def __init__(self): self.lines = []
+            def log(self, m, level='info'): self.lines.append((level, m))
+
+        with mock.patch.object(mod.os, 'kill',
+                               side_effect=lambda pid, sig: killed.append((pid, sig))),                 mock.patch.object(mod, '_pid1_alive', return_value=True),                 mock.patch.object(mod.time, 'time', side_effect=[0, 1, 999]),                 mock.patch.object(mod.time, 'sleep'):
+            mod._exit_for_restart(Rep())
+        kill_sig = getattr(_signal, 'SIGKILL', _signal.SIGTERM)  # Windows 没有 SIGKILL
+        self.assertEqual([s for _, s in killed], [_signal.SIGTERM, kill_sig],
+                         f'超时后应强杀，实际：{killed}')
 
 
 class UpstreamUpdateGuardTest(unittest.TestCase):
@@ -478,6 +498,8 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         from server import db
         msg = db._explain_db_open_failure(sqlite3.OperationalError('x'))
         self.assertIn('卷', msg, '应提示命名卷作为替代')
+        self.assertIn('WB_DATA_VOLUME', msg,
+                      '要给出能直接照做的一行配置，而不只是描述思路')
 
     def test_connect_wraps_into_runtime_error(self) -> None:
         """connect() 要把 sqlite 的原始错误换成上面那条说明。
@@ -505,14 +527,32 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         self.assertIsNone(db._conn, 'failed connect 后应把 _conn 复位')
 
     def test_compose_documents_data_ownership(self) -> None:
-        """compose 里 `./data` 那条必须带权限提示（上游 compose 就有）。"""
+        """compose 里 data 挂载必须带权限提示（上游 compose 就有，issue #30）。"""
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        idx = compose.find('- ./data:/app/data')
-        self.assertGreater(idx, 0, '没找到 data 挂载')
-        # 该行上方 200 字符内应有 chown 提示
-        above = compose[max(0, idx - 400):idx]
-        self.assertIn('chown', above, './data 挂载缺少属主提示（issue #30 的成因）')
+        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/app/data')
+        self.assertGreater(idx, 0, '没找到 data 挂载（默认值必须仍是 ./data）')
+        # 挂载行上方要有「为什么不可写 + 怎么修」，光报错不解决用户的实际问题
+        above = compose[max(0, idx - 1400):idx]
+        self.assertIn('chown', above, 'data 挂载缺少属主提示（issue #30 的成因）')
         self.assertIn('10001', above, '应写明 uid')
+        self.assertIn('WB_DATA_VOLUME=wb-manager-data', above,
+                      '改不了属主的环境要有能直接照做的命名卷开关')
+
+    def test_compose_named_volume_switch_is_declared(self) -> None:
+        """NAS / SMB 改不了属主时，一行 .env 就能切到命名卷（issue #30 复发）。
+
+        命名卷首次创建会继承镜像内 /app/data 的属主（10001），所以无需宿主 chown。
+        开关要同时满足两点：挂载行做变量插值、顶层声明同名卷 —— 只改挂载行
+        而不声明卷，compose 会把它当成相对路径的 bind mount 并报错。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
+        self.assertTrue(
+            any('${WB_DATA_VOLUME:-./data}:/app/data' in v for v in vols),
+            'data 挂载未做成可切换的卷；默认值必须是 ./data，别破坏已有部署')
+        self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
+                      '顶层没声明 wb-manager-data，切到命名卷会失败')
 
 
 class DockerAssetsTest(unittest.TestCase):
@@ -1305,3 +1345,66 @@ class UpstreamHealthProbeAddressTest(unittest.TestCase):
                          f'现在有 {src.count(literal)} 处')
         self.assertIn('wait_health(upstream_health_url()', src,
                       '就绪等待要传派生地址')
+
+class AlpineTimezoneTest(unittest.TestCase):
+    """Alpine 基础镜像必须能按本地时区统计（审计发现 PR #459 漏了 tzdata）。
+
+    本项目的「按天」口径全部依赖本地时区：
+      · `db.day_of()` 用 `time.localtime()`；
+      · SQL 里用 `'localtime'` 修饰符分桶；
+      · 密钥每日 Token 限额按本地日期零点复位。
+    Debian slim 也没装 tzdata，但它自带 `/etc/localtime`（UTC），行为一致。
+    **Alpine 的 busybox 不带 tzdata**，若不显式处理，设了时区也只会静默退回 UTC
+    —— 表现是「时区 +8、统计按 UTC 分天」，且不报任何错。
+    """
+
+    DOCKERFILE = _ROOT / 'Dockerfile'
+
+    def setUp(self) -> None:
+        self.src = self.DOCKERFILE.read_text(encoding='utf-8')
+
+    def test_tz_arg_installs_tzdata(self) -> None:
+        """设了 TZ 就必须装 tzdata 并落 /etc/localtime，不能只写环境变量。"""
+        self.assertIn('ARG TZ=', self.src, '缺少 TZ 构建参数')
+        self.assertIn('apk add --no-cache tzdata', self.src,
+                      'Alpine 必须显式装 tzdata，否则 localtime 静默退回 UTC')
+        self.assertIn('/usr/share/zoneinfo/', self.src, '必须从 zoneinfo 取时区文件')
+        self.assertIn('/etc/localtime', self.src, '必须落 /etc/localtime（musl 优先读它）')
+
+    def test_no_bash_dependency(self) -> None:
+        """Alpine 没有 bash：脚本只能靠 /bin/sh。"""
+        for m in re.finditer(r'^RUN .*', self.src, re.M):
+            self.assertNotIn('/bin/bash', m.group(0), 'Alpine 里没有 /bin/bash')
+
+    def test_uses_busybox_adduser_not_useradd(self) -> None:
+        self.assertIn('adduser', self.src, 'Alpine 用 busybox 的 adduser')
+        self.assertNotRegex(self.src, r'useradd(?![a-z])',
+                            'useradd 在 Alpine 上不存在（是 Debian 的）')
+
+class ComposeTimezoneWiringTest(unittest.TestCase):
+    """compose 的 TZ 必须在**构建期**与**运行期**两处都给（审计发现的缺口）。
+
+    `environment.TZ` 只影响进程环境；镜像里没有 tzdata、`/etc/localtime` 没指向
+    目标时区的话，musl 的 `localtime()` 会静默退回 UTC。而本项目的按日统计与
+    每日 Token 限额复位都按本地时区 —— 两处不一致的表现是「时区写着 +8、
+    数字按 UTC 分天」，不报任何错。
+    """
+
+    COMPOSE = _ROOT / 'docker-compose.yml'
+
+    def setUp(self) -> None:
+        self.src = self.COMPOSE.read_text(encoding='utf-8')
+
+    def test_build_arg_tz_exists(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        self.assertIn('TZ:', head, '必须在 build.args 里传 TZ（决定装不装 tzdata）')
+
+    def test_runtime_and_build_tz_agree(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        tail = self.src[self.src.index('environment:'):]
+        build_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', head, re.M)
+        run_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
+        self.assertIsNotNone(build_tz, 'build.args 缺 TZ')
+        self.assertIsNotNone(run_tz, 'environment 缺 TZ')
+        self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
+                         'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')

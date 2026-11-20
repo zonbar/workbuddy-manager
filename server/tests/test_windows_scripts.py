@@ -309,6 +309,49 @@ class WindowsPythonIsolationTest(unittest.TestCase):
                               f'{name} 没加载 python-env.ps1，无法继承 PYTHONNOUSERSITE')
 
 
+class WindowsHostSettingsTest(unittest.TestCase):
+    """issue #368：启动器里保存的监听地址不能被 prepare 每次启动重置。
+
+    现场：Windows 安装版把 IP 改成 0.0.0.0 保存，重启/开机自启后又变回 127.0.0.1，
+    局域网访问时好时坏。根因是 prepare.ps1 无条件把 0.0.0.0 改写成回环地址。
+    模板默认已经是 127.0.0.1，不需要这条「迁移」；它只会覆盖用户设置。
+    """
+
+    def test_prepare_does_not_reset_user_host(self) -> None:
+        src = (_ROOT / 'windows' / 'prepare.ps1').read_text(encoding='utf-8-sig')
+        self.assertNotIn("WB_MANAGER_HOST=127.0.0.1", src,
+                         'prepare.ps1 仍在改写 WB_MANAGER_HOST，用户保存的 0.0.0.0 会被重置')
+
+    def test_service_tools_uses_env_host(self) -> None:
+        """监听地址必须来自 .env，才能在保存后真正生效。"""
+        src = (_ROOT / 'windows' / 'service-tools.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("WB_MANAGER_HOST", src)
+        self.assertIn("'--host', $bindHost", src)
+
+
+class WindowsAutostartProjectTest(unittest.TestCase):
+    """issue #388：开机自启不能只驻留托盘，还要能按偏好自动启动项目。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_preference_is_persisted_and_gated(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('autostart_project', src)
+        self.assertIn('_chkAutostartProject.Enabled = _chkAutostart.Checked', src,
+                      '「同时启动项目」必须在未勾开机自启时禁用')
+
+    def test_boot_starts_project_quietly(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('StartProject(true)', src,
+                      '开机自启没有调用静默启动')
+        self.assertIn('_openBrowserOnHealthy = !quiet', src,
+                      '静默启动不该自动打开浏览器')
+        self.assertIn('if (quiet) { AppendLog', src,
+                      '静默启动出错时不该弹模态框')
+
 class WindowsAutostartTest(unittest.TestCase):
     """issue #269：Windows 启动器开机自启（HKCU Run + 静默到托盘 + 卸载清理）。"""
 

@@ -61,6 +61,30 @@ def _check_name(name: str | None) -> None:
         raise HTTPException(status_code=400, detail='密钥名称不能只有空格')
 
 
+def _check_custom_token_allowed(token: str) -> None:
+    """自定义密钥形态的入口闸门（issue #447）。
+
+    两道关：
+      1. **部署级开关** `WB_KEY_CUSTOM_ENABLED`（默认关闭）。默认部署只有 `wbk_`
+         随机串 —— 这是既有安全预期，自定义形态是显式选择加入的能力。
+      2. **唯一性**：撞了已有密钥直接 409。按哈希判（明文不参与比对）。
+
+    形态本身（长度 / 字符集 / 弱口令）的校验在 `keysvc._norm_custom_token`，
+    那里同时被 `create_key` 直接调用 —— 即使绕过本路由，也跳不过校验。
+    """
+    if not config.KEY_CUSTOM_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail='自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启',
+        )
+    try:
+        normalized = keysvc._norm_custom_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if keysvc.token_exists(normalized):
+        raise HTTPException(status_code=409, detail='这个密钥已被占用，请换一个')
+
+
 class KeyIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     # 绑定的上游（多上游 / 分组隔离）：null / 0 / 省略 = 默认上游。
@@ -74,9 +98,14 @@ class KeyIn(BaseModel):
     # 积分额度（issue #27）：0 = 不限。与 token 额度各自独立，任一超限即拒绝。
     # 用 float：上游 credit 是小数（如 0.05 表示按倍率扣费）。
     quota_credit: float = 0
+    # 每日 token 限额：0 = 不限。与总额度 quota 各自独立，按本地日期每天 0 点恢复。
+    daily_quota: int = Field(default=0, ge=0)
     # 版本归属：'' = 不限制（存量密钥的形态）。非 cn/global 的值由
     # keysvc._norm_realm 归一化成 ''——不报错，免得旧前端（不带该字段）被拒。
     realm: str = Field(default='', max_length=16)
+    # 自定义密钥形态（issue #447）：填了就原样使用（仍过归一化 + 弱密钥拦截），
+    # 不填 = 默认 `wbk_` + 随机串。需要一个部署级开关才生效（见 WB_KEY_CUSTOM_ENABLED）。
+    custom_token: str | None = None
 
 
 class KeyPatch(BaseModel):
@@ -90,6 +119,7 @@ class KeyPatch(BaseModel):
     models: list[str] | None = None
     quota: int | None = None
     quota_credit: float | None = None
+    daily_quota: int | None = Field(default=None, ge=0)
     realm: str | None = None
 
 
@@ -146,17 +176,28 @@ def create_key(body: KeyIn, request: Request,
     _check_name(body.name)
     _check_ip_allowlist(body.ip_allowlist)
     _check_upstream(body.upstream_id)
-    created = keysvc.create_key(
-        name=body.name,
-        expires_at=body.expires_at,
-        max_ips=body.max_ips,
-        ip_allowlist=body.ip_allowlist,
-        models=body.models,
-        quota=body.quota,
-        realm=body.realm,
-        quota_credit=body.quota_credit,
-        upstream_id=body.upstream_id,
-    )
+    if body.custom_token:
+        _check_custom_token_allowed(body.custom_token)
+    try:
+        created = keysvc.create_key(
+            name=body.name,
+            expires_at=body.expires_at,
+            max_ips=body.max_ips,
+            ip_allowlist=body.ip_allowlist,
+            models=body.models,
+            quota=body.quota,
+            realm=body.realm,
+            quota_credit=body.quota_credit,
+            daily_quota=body.daily_quota,
+            upstream_id=body.upstream_id,
+            custom_token=body.custom_token,
+        )
+    except keysvc.TokenConflict as exc:
+        # 唯一索引兜底命中（并发创建同一 token）：与预检查同样是 409
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # 形态/弱口令问题（含绕过路由直接调用 keysvc 的内部路径）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 密钥是拿额度用的凭证，发放必须留痕（含来源 IP）
     upstream_name = '默认上游'
     if created.get('upstream_id'):
@@ -190,6 +231,37 @@ def reset_usage(key_id: int, user: dict = Depends(security.require_admin)) -> di
     if not keysvc.reset_usage(key_id):
         raise HTTPException(status_code=404, detail='密钥不存在')
     return {'ok': True}
+
+
+@router.post('/{key_id}/reveal')
+def reveal_key(key_id: int, request: Request,
+               user: dict = Depends(security.require_admin)) -> dict:
+    """取回一把已创建密钥的明文（「再复制一次」）。
+
+    为什么要单独一条接口、而不是把它加进列表：列表**只读账号（viewer）也能调**，
+    而明文是能用完额度的凭证 —— 直接下发等于把只读账号升格成「能看到所有密钥」。
+    这里要求会话管理员，且每次都留审计：谁在什么时候看过哪把钥匙，事后查得到。
+
+    `require_admin`（会话管理员）而不是 `require_session_admin`：与「建 / 改 / 删
+    密钥」同一档权限，读明文不该比改密钥更宽松。
+
+    取不回明文时回 409 并**说清怎么办**：盲区是「本列引入前建的存量密钥」，
+    它们那时只存了哈希。这里不能回空串让界面复制出一个空文本。
+    """
+    found = keysvc.reveal_key(key_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail='密钥不存在')
+    if not found['key']:
+        raise HTTPException(
+            status_code=409,
+            detail=('这把密钥创建于「面板保存明文」之前的版本，库中只有它的哈希，'
+                    '无法再取回完整密钥。需要继续使用的话，请新建一把并替换掉'
+                    '（旧密钥会继续有效，确认客户端都换完后再停用它）。'),
+        )
+    # 审计只记**哪一把**（id / 名称 / 前缀），绝不记明文本身。
+    security.audit(user, 'reveal_key', f'{key_id} {found["name"]}'.strip(),
+                   f'前缀={found["prefix"]}；来源 {client_ip(request)}')
+    return found
 
 
 @router.delete('/{key_id}')

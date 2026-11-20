@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -37,6 +37,7 @@ namespace WorkBuddyLauncher
         private TextBox _txtPort;
         private Button _btnSave;
         private CheckBox _chkAutostart;
+        private CheckBox _chkAutostartProject;
         private Button _btnUpdate;
         private TextBox _log;
 
@@ -49,6 +50,7 @@ namespace WorkBuddyLauncher
         private bool _credentialLookupRunning;
         private bool _autostartLoading;
         private bool _startHidden;
+        private bool _autoStartOnBoot;
         private bool _updating;
         private readonly EventWaitHandle _wake;
         private string _currentHost = EnvConfig.DefaultHost;
@@ -111,9 +113,40 @@ namespace WorkBuddyLauncher
             {
                 AppendLog("[INFO] 已按开机自启静默启动，驻留托盘（双击托盘图标打开窗口）。");
                 ShowTrayBalloonOnce();
+                // 自启时是否同时拉起项目（issue #388 / #449）：quiet=true 不弹
+                // 错误框、不打开浏览器。真正的启动点见构造函数末尾的 HandleCreated 注册。
+                _autoStartOnBoot = string.Equals(
+                    _settings.Get("autostart_project", "0"), "1", StringComparison.Ordinal);
             }
 
-            Shown += delegate { ProbeAsync(); };
+            Shown += delegate
+            {
+                ProbeAsync();
+            };
+
+            // 开机自启时拉起项目**不能挂在 Shown / Load 上**（issue #449）。
+            //
+            // 静默模式走 SetVisibleCore 拦下显示。实测（最小 WinForms 复现）：
+            // 拦下显示后 **`Load` 与 `Shown` 都不会触发** —— 两者都由
+            // `SetVisibleCore(true)` 内部驱动。所以原实现（挂 Shown）与第一版修复
+            // （改挂 Load）都会「托盘图标在、项目没起」，只有手动双击托盘
+            // （RestoreFromTray → 真正显示一次）才补触发。
+            //
+            // 正确的触发点是 `HandleCreated`：它在 `CreateHandle()` 之后触发，
+            // 静默路径同样会走到，且此时句柄已存在、`BeginInvoke` 可以安全排队
+            // （构造函数里直接 BeginInvoke 会因无句柄而静默失败）。
+            if (_autoStartOnBoot)
+            {
+                _autoStartOnBoot = false;
+                HandleCreated += delegate
+                {
+                    BeginInvokeSafe(delegate
+                    {
+                        AppendLog("[RUN] 开机自启：按偏好自动启动项目。");
+                        StartProject(true);
+                    });
+                };
+            }
         }
 
         /// 开机静默启动：Application.Run 会请求显示窗口，这里拦下第一次，
@@ -199,6 +232,14 @@ namespace WorkBuddyLauncher
             _chkAutostart.CheckedChanged += OnAutostartChanged;
             _content.Controls.Add(_chkAutostart);
 
+            // issue #388：开机自启只驻留托盘，项目仍要用户手点「启动项目」——
+            // 那自启就没有意义。只有勾了开机自启才允许这一项。
+            _chkAutostartProject = new CheckBox();
+            _chkAutostartProject.Text = "开机自启时同时启动项目（不弹出面板）";
+            _chkAutostartProject.SetBounds(40, 228, 380, 22);
+            _chkAutostartProject.CheckedChanged += OnAutostartProjectChanged;
+            _content.Controls.Add(_chkAutostartProject);
+
             // 检查更新（issue #288）：查最新 Release → 下载安装包 + 校验 sha256 → 启动安装向导。
             _btnUpdate = new Button();
             _btnUpdate.Text = "检查更新";
@@ -208,7 +249,7 @@ namespace WorkBuddyLauncher
 
             var logLabel = new Label();
             logLabel.Text = "输出日志";
-            logLabel.SetBounds(24, 236, 432, 20);
+            logLabel.SetBounds(24, 260, 432, 20);
             _content.Controls.Add(logLabel);
 
             _log = new TextBox();
@@ -216,7 +257,7 @@ namespace WorkBuddyLauncher
             _log.ReadOnly = true;
             _log.ScrollBars = ScrollBars.Vertical;
             _log.BackColor = SystemColors.Window;
-            _log.SetBounds(24, 258, 432, 178);
+            _log.SetBounds(24, 282, 432, 154);
             _content.Controls.Add(_log);
         }
 
@@ -224,6 +265,7 @@ namespace WorkBuddyLauncher
         /// 不能让界面显示「已开启」而注册表里其实没有。
         private void OnAutostartChanged(object sender, EventArgs e)
         {
+            _chkAutostartProject.Enabled = _chkAutostart.Checked;
             if (_autostartLoading) { return; }
             try
             {
@@ -246,6 +288,15 @@ namespace WorkBuddyLauncher
                 MessageBox.Show(this, "设置开机自启失败：" + ex.Message, "开机自启",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        /// 记住「开机自启时同时启动项目」。只有开机自启生效时才允许勾选；
+        /// 勾选状态本身不写注册表，运行时由构造函数里的 _autoStartOnBoot 决定。
+        private void OnAutostartProjectChanged(object sender, EventArgs e)
+        {
+            _settings.Set("autostart_project", _chkAutostartProject.Checked ? "1" : "0");
+            try { _settings.Save(); }
+            catch (Exception ex) { AppendLog("[WARN] 保存启动偏好失败：" + ex.Message); }
         }
 
         private Button MakeActionButton(string text, int x, EventHandler onClick)
@@ -393,6 +444,9 @@ namespace WorkBuddyLauncher
             _autostartLoading = true;
             _chkAutostart.Checked = Autostart.IsEnabled();
             _autostartLoading = false;
+            _chkAutostartProject.Checked =
+                string.Equals(_settings.Get("autostart_project", "0"), "1", StringComparison.Ordinal);
+            _chkAutostartProject.Enabled = _chkAutostart.Checked;
         }
 
         private string AddressUrl()
@@ -402,7 +456,8 @@ namespace WorkBuddyLauncher
 
         private void UpdateAddressLabel()
         {
-            _lblAddress.Text = "面板地址：" + AddressUrl();
+            string hint = EnvConfig.IsWildcard(_currentHost) ? "（监听所有网卡）" : "";
+            _lblAddress.Text = "面板地址：" + AddressUrl() + hint;
         }
 
         private void SetState(ProjectState state, string note)
@@ -443,13 +498,23 @@ namespace WorkBuddyLauncher
 
         private void OnStartClick(object sender, EventArgs e)
         {
+            StartProject(false);
+        }
+
+        /// <summary>
+        /// 启动项目。quiet=true 用于开机自启：出错只写日志，不弹窗、不打开浏览器 ——
+        /// 登录时没人会盯着一个模态框点确定。
+        /// </summary>
+        private void StartProject(bool quiet)
+        {
             string host = _txtHost.Text.Trim();
             int port;
             string error;
             if (!EnvConfig.TryValidateHost(host, out error) ||
                 !EnvConfig.TryValidatePort(_txtPort.Text, out port, out error))
             {
-                MessageBox.Show(this, error, "配置无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (quiet) { AppendLog("[ERROR] 自启动配置无效：" + error); }
+                else { MessageBox.Show(this, error, "配置无效", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
                 return;
             }
             try
@@ -459,7 +524,8 @@ namespace WorkBuddyLauncher
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "写入配置失败：" + ex.Message, "启动", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (quiet) { AppendLog("[ERROR] 自启动写入配置失败：" + ex.Message); }
+                else { MessageBox.Show(this, "写入配置失败：" + ex.Message, "启动", MessageBoxButtons.OK, MessageBoxIcon.Error); }
                 return;
             }
             _currentHost = host;
@@ -467,9 +533,11 @@ namespace WorkBuddyLauncher
             UpdateAddressLabel();
 
             // 端口已被其他程序占用时立即提示（常见：机器上另有一个实例占着默认端口），
-            // 而不是进入「启动中…」傻等健康检查超时
+            // 而不是进入「启动中…」傻等健康检查超时。
+            // 探测用连接地址，占用判断用**监听地址**（`::` 与 `0.0.0.0` 各自映射到
+            // 对应的 Any，否则通配监听会被误判成端口空闲）。
             if (!HealthProbe.Check(EnvConfig.ToConnectHost(host), port, 1000) &&
-                PortCheck.InUse(EnvConfig.ToConnectHost(host), port))
+                PortCheck.InUse(host, port))
             {
                 MessageBox.Show(this,
                     "端口 " + port + " 已被其他程序占用，无法在此端口启动。\n" +
@@ -505,7 +573,7 @@ namespace WorkBuddyLauncher
                                     }
                                     _wait = WaitKind.Healthy;
                                     _waitSince = DateTime.Now;
-                                    _openBrowserOnHealthy = true;
+                                    _openBrowserOnHealthy = !quiet;
                                     AppendLog("[RUN] 服务进程已拉起，等待健康检查…");
                                     UpdateButtons();
                                 });
@@ -641,7 +709,7 @@ namespace WorkBuddyLauncher
                 {
                     _wait = WaitKind.None;
                     SetState(ProjectState.Running, null);
-                    AppendLog("[OK] 服务已就绪：" + AddressUrl());
+                    AppendLog("[OK] 服务已就绪：" + AddressUrl() + (EnvConfig.IsWildcard(_currentHost) ? "（监听所有网卡，局域网可访问）" : ""));
                     if (_openBrowserOnHealthy)
                     {
                         _openBrowserOnHealthy = false;

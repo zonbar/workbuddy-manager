@@ -1,7 +1,7 @@
 'use client';
 
 import {useCallback, useState} from 'react';
-import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server} from 'lucide-react';
+import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server, CalendarDays, UserRound} from 'lucide-react';
 import {
   Area,
   Bar,
@@ -16,8 +16,10 @@ import {
 } from 'recharts';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
-import {statsApi, errText} from '@/lib/api';
+import {statsApi, errText, type StatsRange} from '@/lib/api';
 import type {
+  AccountModelUsageRow,
+  AccountUsageRow,
   StatsSummary,
   UpstreamStats,
   UsageBreakdown,
@@ -28,12 +30,16 @@ import {
   chartSpecFor,
   dailySeries,
   hourlySeries,
+  hourlyTargetFor,
   todayKeyLocal,
+  yesterdayKeyLocal,
   type ChartPoint,
 } from '@/lib/usage-chart';
-import {fmtCompact, fmtNumber, fmtCredit} from '@/lib/format';
+import {fmtCompact, fmtNumber, fmtCredit, fmtMoney } from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
+import {RealtimeStatsStrip} from '@/components/common/layout/RealtimeStatsStrip';
+import Link from 'next/link';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -41,6 +47,7 @@ import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
+import {Input} from '@/components/ui/input';
 import {
   Select,
   SelectContent,
@@ -120,7 +127,30 @@ export default function StatsPage() {
    * 与选择器天然同一口径，不需要各自翻译一遍。
    */
   const [days, setDays] = useState('1');
-  const d = Number(days) || 1;
+  /** 自定义日期（issue #257）：两端都含；只有选「自定义」且两格都填了才生效。 */
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const isCustom = days === 'custom';
+  const isYesterday = days === 'yesterday';
+  const yesterday = yesterdayKeyLocal();
+  const range: StatsRange | undefined =
+    isCustom && customStart && customEnd
+      ? {start: customStart, end: customEnd}
+      : isYesterday
+        ? {start: yesterday, end: yesterday}
+        : undefined;
+  /** 趋势图按小时画时该查哪一天（`null` = 这个范围按天画） */
+  const hourlyTarget = hourlyTargetFor({
+    days, customStart, customEnd, todayKey: todayKeyLocal(),
+  });
+  const spanDays = (() => {
+    if (isYesterday) return 1;
+    if (!isCustom || !customStart || !customEnd) return Number(days) || 1;
+    const a = Date.parse(customStart), b = Date.parse(customEnd);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return 30;
+    return Math.min(3650, Math.max(1, Math.round(Math.abs(b - a) / 86400000) + 1));
+  })();
+  const d = spanDays;
 
   /**
    * 本页四份统计。
@@ -139,15 +169,20 @@ export default function StatsPage() {
   } = useAsyncAll(
     {
       summary: () => statsApi.summary(realm),
-      daily: () => statsApi.daily(d, realm),
-      // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
-      // 小时数据，其它范围直接给空数组，省一次请求。
-      hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
-                                  : Promise.resolve([] as UsageHourPoint[])),
-      byModel: () => statsApi.byModel(d, realm),
-      byKey: () => statsApi.byKey(d, realm),
+      daily: () => statsApi.daily(d, realm, range),
+      // 单日（今日 / 昨日 / 自定义同一天）按小时画，多日按天画。判据收在
+      // `hourlyTargetFor()` 里：自定义选同一天曾经漏了这一步，图上 24 根柱子全 0。
+      hourly: () => {
+        const target = hourlyTargetFor({days, customStart, customEnd, todayKey: todayKeyLocal()});
+        return target ? statsApi.hourly(target.day, realm)
+                      : Promise.resolve([] as UsageHourPoint[]);
+      },
+      byModel: () => statsApi.byModel(d, realm, range),
+      byKey: () => statsApi.byKey(d, realm, range),
+      byAccount: () => statsApi.byAccount(d, realm, range),
+      byAccountModel: () => statsApi.byAccountModel(d, realm, range),
     },
-    [realm, days],
+    [realm, days, customStart, customEnd],
   );
 
   /**
@@ -183,6 +218,8 @@ export default function StatsPage() {
   const daily: UsagePoint[] = values.daily ?? EMPTY_POINTS;
   const byModel: UsageBreakdown[] = values.byModel ?? EMPTY_BREAKDOWN;
   const byKey: UsageBreakdown[] = values.byKey ?? EMPTY_BREAKDOWN;
+  const byAccount: AccountUsageRow[] = values.byAccount?.items ?? [];
+  const byAccountModel: AccountModelUsageRow[] = values.byAccountModel?.items ?? [];
   const upstream: UpstreamStats | null = upstreamValues.upstream ?? null;
 
   const failedCount = Object.keys(errors).length;
@@ -204,7 +241,7 @@ export default function StatsPage() {
    *  · 多日 → 按天并补齐到窗口长度（缺的那天不再是「凭空消失」而是画成 0）。
    */
   const chartData: ChartPoint[] = spec.granularity === 'hour'
-    ? hourlySeries(hourly, new Date().getHours())
+    ? hourlySeries(hourly, hourlyTarget?.isToday ? new Date().getHours() : undefined)
     : dailySeries(daily, d, todayKeyLocal());
 
   /** 今日失败总数（4xx + 5xx）。单独来自请求日志——用量汇总只含成功请求。 */
@@ -226,11 +263,27 @@ export default function StatsPage() {
             <SelectContent>
               {/* 「今日」排在第一位并作为默认：与上方卡片的「今日」口径对齐 */}
               <SelectItem value="1">{t('stats.today')}</SelectItem>
+              <SelectItem value="yesterday">{t('stats.yesterday')}</SelectItem>
               <SelectItem value="7">{t('stats.last7')}</SelectItem>
               <SelectItem value="30">{t('stats.last30')}</SelectItem>
               <SelectItem value="90">{t('stats.last90')}</SelectItem>
+              <SelectItem value="custom">{t('stats.customRange')}</SelectItem>
             </SelectContent>
           </Select>
+          {isCustom && (
+            <div className="flex items-center gap-1.5">
+              <CalendarDays className="h-3.5 w-3.5 text-muted-foreground" />
+              <Input type="date" value={customStart} max={customEnd || undefined}
+                     aria-label={t('stats.startDate')}
+                     onChange={(e) => setCustomStart(e.target.value)}
+                     className="h-8 w-[140px] rounded-full text-xs" />
+              <span className="text-xs text-muted-foreground">–</span>
+              <Input type="date" value={customEnd} min={customStart || undefined}
+                     aria-label={t('stats.endDate')}
+                     onChange={(e) => setCustomEnd(e.target.value)}
+                     className="h-8 w-[140px] rounded-full text-xs" />
+            </div>
+          )}
           {isAdmin && (
             <ConfirmDialog
               title={t('stats.repairTitle')}
@@ -349,6 +402,10 @@ export default function StatsPage() {
         </div>
       )}
 
+      {/* 实时指标：口径与下面那排累计卡不同 —— 这两个数说的是「此刻」，由组件自己
+          每 1 秒心跳一次，不跟本页 60 秒的刷新节奏走（标签页不可见时跳过）。 */}
+      <RealtimeStatsStrip days={d} />
+
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 md:gap-4">
         <StatCard
           label={t('stats.todayRequests')}
@@ -399,6 +456,49 @@ export default function StatsPage() {
         />
       </section>
 
+      {/* 按 DeepSeek 官方价估算的费用（issue #380）。
+          和上面那张「积分」卡并排看才完整：积分是上游**真实扣**的，这里回答的是
+          「同样这些 token，走官方 API 要花多少钱」。两者口径不同，所以分开放、
+          分开标注，不合成一个数字。 */}
+      <section className="rounded-[20px] bg-muted p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Coins className="h-4 w-4" />
+            {t('stats.costTitle')}
+          </div>
+          <Link
+            href="/settings/models"
+            className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+          >
+            {t('stats.costPriceLink')}
+          </Link>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          {([
+            ['today', t('stats.costToday'), summary?.today_cost, summary?.today_unpriced],
+            ['week', t('stats.costWeek'), summary?.week_cost, summary?.week_unpriced],
+            ['total', t('stats.costTotal'), summary?.total_cost, summary?.total_unpriced],
+          ] as const).map(([key, label, value, unpriced]) => (
+            <div key={key}>
+              <div className="text-[11px] text-muted-foreground">{label}</div>
+              <div className="mt-0.5 text-lg font-semibold tabular-nums">
+                {fmtMoney(value, summary?.cost_currency)}
+              </div>
+              {!!unpriced && (
+                // 有没算进费用的调用时必须说出来：否则用户会拿一个悄悄缩水的
+                // 金额当成「全量花费」。
+                <div className="mt-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+                  {t('stats.costUnpriced', {n: fmtNumber(unpriced)})}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
+          {t('stats.costNote')}
+        </p>
+      </section>
+
       <section className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="text-sm font-medium">{t('stats.tokenTrend')}</div>
@@ -424,7 +524,15 @@ export default function StatsPage() {
                   /* 24 个小时（或 90 天）标签全画出来会糊成一片，按 spec 抽稀。 */
                   interval={Math.max(0, spec.tickEvery - 1)}
                 />
-                <YAxis tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
+                <YAxis yAxisId="tok" tickLine={false} axisLine={false} fontSize={11}
+                       stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
+                {/* 成功 / 失败是「次数」，与 token 差好几个数量级；放右轴才看得见。 */}
+                <YAxis yAxisId="cnt" orientation="right" tickLine={false} axisLine={false}
+                       fontSize={11} stroke="var(--muted-foreground)" allowDecimals={false}
+                       width={40} />
+                {/* 积分（issue #427）：与 token 也不同量级，单独一根更靠外的右轴，
+                    不和次数挤在一根上。hidden 只保留轴线占位，避免三根轴互相覆盖。 */}
+                <YAxis yAxisId="cr" orientation="right" hide />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
                   contentStyle={{
@@ -439,11 +547,18 @@ export default function StatsPage() {
                     if (label === 'failed') {
                       return [fmtNumber(Number(value)), t('dashboard.failedRequests')];
                     }
+                    if (label === 'success') {
+                      return [fmtNumber(Number(value)), t('stats.successRequests')];
+                    }
+                    if (label === 'credit') {
+                      return [fmtCredit(Number(value)), t('stats.creditSeries')];
+                    }
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
                 />
                 {spec.shape === 'bar' ? (
                   <Bar
+                    yAxisId="tok"
                     dataKey="tokens"
                     name="tokens"
                     fill="var(--chart-1)"
@@ -464,6 +579,7 @@ export default function StatsPage() {
                   /* 30 / 90 天用面积：柱子细得看不清起伏，而面积图的形状对
                      「总量趋势」更直观（尖峰一眼可见）。 */
                   <Area
+                    yAxisId="tok"
                     type="monotone"
                     dataKey="tokens"
                     name="tokens"
@@ -473,10 +589,35 @@ export default function StatsPage() {
                     strokeWidth={2}
                   />
                 )}
+                {/* 成功数（issue #369 第 3 点）：与失败同一根右轴，量级可比；
+                    左轴 token 不会被次数压扁。 */}
+                <Line
+                  yAxisId="cnt"
+                  type="monotone"
+                  dataKey="success"
+                  name="success"
+                  stroke="var(--chart-2)"
+                  strokeWidth={1.5}
+                  dot={false}
+                />
+                {/* 积分消耗（issue #427）：与签到收入图不同，这条是**实际扣费**按
+                    时段聚合，走独立的右轴。虚线是为了与成功/失败两条次数线区分开——
+                    三者都可能贴 0，样式不给区分就分不清谁是谁。 */}
+                <Line
+                  yAxisId="cr"
+                  type="monotone"
+                  dataKey="credit"
+                  name="credit"
+                  stroke="var(--chart-4)"
+                  strokeWidth={1.5}
+                  strokeDasharray="5 3"
+                  dot={false}
+                />
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子
                     会把柱形压扁。线只作「那天出过事」的信号，具体数值看悬停。
                     没有失败时贴着 0，不干扰读数。 */}
                 <Line
+                  yAxisId="cnt"
                   type="monotone"
                   dataKey="failed"
                   name="failed"
@@ -497,6 +638,10 @@ export default function StatsPage() {
         <BreakdownPanel title={t('stats.byModel')} icon={Cpu} items={byModel} throughput />
         <BreakdownPanel title={t('stats.byKey')} icon={KeyRound} items={byKey} />
       </section>
+
+      {/* 按「日期 × 账号」聚合（issue #402）：看每个号每天用了多少、扣了多少积分。 */}
+      <AccountUsagePanel items={byAccount} />
+      <AccountModelUsagePanel items={byAccountModel} />
 
       {/* 上游自己那份统计（issue #59）。**单独一段、口径写明**：它含直连上游的
           调用、且自上游进程启动累计，与上面的时段选择器无关——混着看会得出
@@ -547,7 +692,7 @@ export default function StatsPage() {
                   {upstream.models?.map((m, i) => (
                     <TableRow key={`${m.model}-${i}`} className="border-b border-border/40">
                       <TableCell className="pl-0">
-                        <span className="max-w-[220px] truncate text-xs font-medium">{m.model || t('metric.unknown')}</span>
+                        <span className="max-w-[220px] truncate text-xs font-medium" title={m.model || undefined}>{m.model || t('metric.unknown')}</span>
                       </TableCell>
                       <TableCell className="text-xs tabular-nums">{fmtNumber(m.requests)}</TableCell>
                       <TableCell className="text-xs tabular-nums">{fmtCompact(m.total_tokens)}</TableCell>
@@ -562,6 +707,94 @@ export default function StatsPage() {
         ) : null}
       </section>
     </div>
+  );
+}
+
+/** 按「账号 × 模型」的用量表（issue #369 第 2 点）。 */
+function AccountModelUsagePanel({items}: {items: AccountModelUsageRow[]}) {
+  const t = useT();
+  return (
+    <section className="rounded-[20px] bg-muted p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+        <Cpu className="h-4 w-4" />
+        {t('stats.byAccountModel')}
+      </div>
+      {items.length ? (
+        <div className="max-h-[420px] overflow-auto">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-b border-border/60 hover:bg-transparent">
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.account')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.model')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.requestsShort')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((row, i) => (
+                <TableRow key={`${row.account}-${row.model}-${i}`} className="border-b border-border/40">
+                  <TableCell className="max-w-[220px] truncate text-xs" title={row.account}>
+                    {row.nickname || row.uid8 || row.account}
+                  </TableCell>
+                  <TableCell className="max-w-[240px] truncate text-xs font-mono" title={row.model}>
+                    {row.model}
+                  </TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtNumber(row.requests)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCompact(row.tokens)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCredit(row.credit)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground">{t('stats.noUsageData')}</div>
+      )}
+    </section>
+  );
+}
+
+/** 按「日期 × 账号」的用量表（issue #402）。 */
+function AccountUsagePanel({items}: {items: AccountUsageRow[]}) {
+  const t = useT();
+  return (
+    <section className="rounded-[20px] bg-muted p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+        <UserRound className="h-4 w-4" />
+        {t('stats.byAccount')}
+      </div>
+      {items.length ? (
+        <div className="max-h-[420px] overflow-auto">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-b border-border/60 hover:bg-transparent">
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.date')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.account')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.requestsShort')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((row, i) => (
+                <TableRow key={`${row.day}-${row.account}-${i}`} className="border-b border-border/40">
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">{row.day}</TableCell>
+                  <TableCell className="max-w-[240px] truncate text-xs" title={row.account}>
+                    {row.nickname || row.uid8 || row.account}
+                  </TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtNumber(row.requests)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCompact(row.tokens)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCredit(row.credit)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground">{t('stats.noUsageData')}</div>
+      )}
+    </section>
   );
 }
 
@@ -615,6 +848,7 @@ function BreakdownPanel({
                   {t('stats.tokensPerSec')}
                 </TableHead>
               )}
+              <TableHead className="whitespace-nowrap text-[11px] text-muted-foreground">{t('stats.colCost')}</TableHead>
               <TableHead className="pr-0 text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
             </TableRow>
           </TableHeader>
@@ -626,7 +860,7 @@ function BreakdownPanel({
                   <TableCell className="pl-0">
                     <div className="flex items-center gap-2">
                       <span className="h-2 w-2 rounded-full" style={{background: CHART_COLORS[i % CHART_COLORS.length]}} />
-                      <span className="max-w-[140px] truncate text-xs font-medium">{it.name || t('metric.unknown')}</span>
+                      <span className="max-w-[140px] truncate text-xs font-medium" title={it.name || undefined}>{it.name || t('metric.unknown')}</span>
                     </div>
                     <div className="mt-1.5 h-1 w-full max-w-[140px] overflow-hidden rounded-full bg-border">
                       <div
@@ -651,6 +885,11 @@ function BreakdownPanel({
                       )}
                     </TableCell>
                   )}
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                    {it.cost != null ? fmtMoney(it.cost) : (
+                      <span className="text-muted-foreground/70" title={t('stats.costUnavailableHint')}>—</span>
+                    )}
+                  </TableCell>
                   <TableCell className="pr-0 text-xs tabular-nums">
                     {it.credit > 0 ? fmtCredit(it.credit) : <span className="text-muted-foreground/70">—</span>}
                   </TableCell>

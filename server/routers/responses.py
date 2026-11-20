@@ -44,6 +44,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, keysvc, upstreamsvc
+from ..services import tap as tap_svc
 from . import gateway
 
 logger = logging.getLogger('workbuddy.responses')
@@ -900,6 +901,18 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
     if choice is not None:
         out['tool_choice'] = choice
 
+    # `parallel_tool_calls` 在 Responses 与 Chat Completions 里是**同名同语义**的
+    # 顶层字段，但两者缺省不同：Responses 缺省 true，而上游 Chat 侧把「没写」
+    # 当成自己的默认。所以只在客户端**显式给了布尔值**时才转告上游——缺省不写，
+    # 与 `anthropic.py` 里 `disable_parallel_tool_use` 的映射同口径（只有明确
+    # false 才改行为）。
+    #
+    # 漏了这一段的表现：客户端传 `parallel_tool_calls: false`（Claude Code、
+    # Codex 这类客户端在单工具回合里会传）时上游照样并发出多个工具调用，
+    # 客户端按「只该有一个」解析，多出来的那个会被丢掉或直接报参数错。
+    if isinstance(body.get('parallel_tool_calls'), bool):
+        out['parallel_tool_calls'] = body['parallel_tool_calls']
+
     reasoning = body.get('reasoning')
     if isinstance(reasoning, dict) and isinstance(reasoning.get('effort'), str):
         out['reasoning_effort'] = reasoning['effort']
@@ -1115,6 +1128,7 @@ def to_responses_object(
     resp_id: str,
     custom_tool_names: set[str] | None = None,
     bridge: _ToolBridge | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
     """Chat Completions 非流式响应 → Responses 响应体。"""
     custom_tool_names = custom_tool_names or set()
@@ -1186,7 +1200,9 @@ def to_responses_object(
         'model': model,
         'output': output,
         'output_text': text if isinstance(text, str) else '',
-        'parallel_tool_calls': True,
+        # 回显客户端给的值；未给时保持历史默认（true），与 OpenAI 的缺省一致。
+        'parallel_tool_calls': (parallel_tool_calls
+                                if isinstance(parallel_tool_calls, bool) else True),
         'error': None,
         'incomplete_details': incomplete,
         'usage': _usage_object(data.get('usage') or {}),
@@ -1676,6 +1692,10 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if not isinstance(model, str) or not model.strip():
         return _failed('model 必须是字符串', 400, 'invalid_request_error', 'invalid_model')
 
+    # 客户端原样的 Responses 请求体（快照要在 clamp_max_tokens 之前 —— 那一步
+    # 会就地改 `max_output_tokens`，之后就看不出客户端原本要了多少）。
+    client_body = tap_svc.snapshot(body)
+
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（含版本隔离与配额）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
     mapped = gateway._map_model(model)
@@ -1694,7 +1714,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         custom_tool_names = bridge.custom_names
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _failed(f'请求转换失败：{exc}', 400)
 
     if not payload.get('messages'):
@@ -1719,16 +1740,25 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     try:
         upstream = upstreamsvc.resolve_for_key(key)
     except upstreamsvc.UpstreamUnavailable as exc:
-        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
     url = f'{upstream["base_url"]}/v1/chat/completions'
+    # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
+    up_headers = gateway._upstream_headers(upstream)
+    # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
                 resp = await client.post(url, json=payload,
-                                         headers=gateway._upstream_headers(upstream))
+                                         headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1744,6 +1774,24 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
                 usage=usage, effort=effort,
             )
+            # 客户端视角：Responses 客户端实际收到的报文（翻译后的形态）。
+            client_doc = None
+            if resp.status_code < 400 and isinstance(data, dict):
+                try:
+                    client_doc = to_responses_object(
+                        data, model, resp_id, custom_tool_names, bridge,
+                        body.get('parallel_tool_calls'))
+                except Exception:  # noqa: BLE001 - 翻译失败不该影响抓包
+                    client_doc = None
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses',
+                status=resp.status_code, latency_ms=latency, stream=False,
+                payload=data, usage=usage,
+                error=None if resp.status_code < 400 else str(data)[:500],
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_doc,
+            )
             if resp.status_code >= 400:
                 return _failed(_upstream_error_text(data, resp), resp.status_code,
                                hint=gateway._error_hint(data))
@@ -1753,13 +1801,18 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 # 内容作为错误暴露出来，让问题可见。
                 return _failed('上游返回了无法解析的响应：' + resp.text[:300],
                                502, 'api_error', 'upstream_invalid_body')
+            # bridge 必须一起传：它负责把展开后的 Chat 名还原成客户端原名
+            # （命名空间子工具 / 重名改名）。漏传时非流式路径会把 `read_file_2`
+            # 这类内部名原样发给客户端，而**同一个请求只要带上 stream 就会还原**
+            # ——同一个请求换个标志就得到两套工具名，客户端按名字回传下一轮时
+            # 会匹配不上。
+            #
+            # 复用上面为抓包算好的那份：翻译一次就够（同一份数据翻译两次，除了
+            # 多花时间，还可能因两次取值不同而让界面与实际响应对不上）。
             return JSONResponse(
-                # bridge 必须一起传：它负责把展开后的 Chat 名还原成客户端原名
-                # （命名空间子工具 / 重名改名）。漏传时非流式路径会把
-                # `read_file_2` 这类内部名原样发给客户端，而**同一个请求只要带上
-                # stream 就会还原**——同一个请求换个标志就得到两套工具名，
-                # 客户端按名字回传下一轮时会匹配不上。
-                to_responses_object(data, model, resp_id, custom_tool_names, bridge)
+                client_doc if client_doc is not None else
+                to_responses_object(data, model, resp_id, custom_tool_names, bridge,
+                                    body.get('parallel_tool_calls'))
             )
         except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             return _failed(
@@ -1768,19 +1821,27 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses', status=502,
+                latency_ms=latency, stream=False, error=str(exc),
+                upstream_body=payload, upstream_headers=up_headers, trace_id=trace_id,
+            )
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
         req = client.build_request('POST', url, json=payload,
-                                   headers=gateway._upstream_headers(upstream))
+                                   headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _failed(f'上游不可用：{exc}', 502)
 
     # 上游直接报错：**开流之前**用真实状态码回掉。
@@ -1809,6 +1870,12 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         return _failed(_upstream_error_text(parsed, None, fallback=text),
                        resp.status_code, hint=gateway._error_hint(parsed))
 
+    # 抓包用的原始流缓冲（`pending` 会被逐行消费，拼不出完整响应，同 gateway）
+    raw_stream = tap_svc.RawStream()
+    # 回给客户端的那条流（Responses 事件）。`raw_stream` 是上游 OpenAI 形态，
+    # 这一份才是客户端手里的报文。
+    client_stream = tap_svc.RawStream()
+
     async def gen():
         pending = ''
         translator = _StreamTranslator(
@@ -1819,7 +1886,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
         try:
             async for chunk in resp.aiter_bytes():
-                pending += chunk.decode('utf-8', errors='ignore')
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
+                pending += piece
 
                 if len(pending) > MAX_SSE_BUFFER:
                     logger.warning('SSE 缓冲超过 %d 字节仍未见换行，中止转发', MAX_SSE_BUFFER)
@@ -1855,6 +1924,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         break
 
                     for event in translator.feed(obj):
+                        client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
                     if translator.saw_content and first_token_ms is None:
@@ -1866,7 +1936,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             if error_text:
                 # 收尾事件已发出就不能再报错了（客户端已按成功处理），所以
                 # 先发终止事件之外的失败事件、**不**走 finish()
-                yield _event('response.failed', {
+                failed_event = _event('response.failed', {
                     'type': 'response.failed',
                     'response': {
                         'id': resp_id,
@@ -1878,8 +1948,11 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         'error': {'code': 'upstream_error', 'message': error_text},
                     },
                 })
+                client_stream.feed(failed_event.decode('utf-8', 'ignore'))
+                yield failed_event
             else:
                 for event in translator.finish(None, force=True):
+                    client_stream.feed(event.decode('utf-8', 'ignore'))
                     yield event
         finally:
             await resp.aclose()
@@ -1898,6 +1971,14 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
                 usage=usage, first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses', status=200,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

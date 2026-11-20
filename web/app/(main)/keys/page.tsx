@@ -1,14 +1,14 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucide-react';
+import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw, Copy, Check, Loader2} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {keyApi, upstreamsApi, errText} from '@/lib/api';
 import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey, KeyImportResult, KeyImportStatus, UpstreamEndpoint} from '@/lib/types';
-import {fmtDateTime, fmtNumber} from '@/lib/format';
+import {copyText, fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -65,10 +65,19 @@ interface FormState {
   quota: string;
   /** 积分额度（issue #27）：0 = 不限。按上游返回的**真实扣费**累计 */
   quotaCredit: string;
+  /** 每日 token 限额：0 = 不限，按服务器本地日期每天 0 点恢复 */
+  dailyQuota: string;
   /** 版本归属：'cn' | 'global' | ''（不限制，仅存量密钥） */
   realm: Realm | '';
   /** 绑定的上游（账号池分组）：null = 默认上游。见 server/upstreamsvc.py */
   upstream_id: number | null;
+  /**
+   * 自定义密钥形态（issue #447）：空串 = 默认 `wbk_` + 随机串。
+   *
+   * 只在**新建**时有效（密钥创建后不可改名 —— 换 token 等于换一把密钥，
+   * 已有客户端的配置会立刻失效）。需要部署开启 WB_KEY_CUSTOM_ENABLED。
+   */
+  customToken: string;
 }
 
 const emptyForm: FormState = {
@@ -80,8 +89,10 @@ const emptyForm: FormState = {
   models: '',
   quota: '0',
   quotaCredit: '0',
+  dailyQuota: '0',
   realm: 'cn',
   upstream_id: null,
+  customToken: '',
 };
 
 function toLines(v: string): string[] {
@@ -140,6 +151,17 @@ export default function KeysPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState(false);
   const [issued, setIssued] = useState<string | null>(null);
+  /**
+   * 「再复制一次」：正在查看的密钥（含明文）与正在请求的那一行。
+   *
+   * 明文只在点开时向后端要一次（`POST /api/keys/{id}/reveal`，会话管理员 +
+   * 审计日志），**不随列表下发** —— 列表只读账号也能调，凭据不该跟着列表走。
+   * `revealing` 记的是哪一行在等，避免连点把同一行请求两次。
+   */
+  const [revealed, setRevealed] = useState<{name: string; key: string} | null>(null);
+  const [revealing, setRevealing] = useState<number | null>(null);
+  /** 刚复制成功的那一行（短暂显示对勾，移动端看不到 toast 时也有反馈） */
+  const [copiedId, setCopiedId] = useState<number | null>(null);
   /**
    * 一次性展示弹窗里选中的导出目标（cc-switch 还要分 Claude / Codex）。
    *
@@ -236,8 +258,11 @@ export default function KeysPage() {
       models: (k.models || []).join(', '),
       quota: String(k.quota ?? 0),
       quotaCredit: String(k.quota_credit ?? 0),
+      dailyQuota: String(k.daily_quota ?? 0),
       realm: k.realm || '',
       upstream_id: k.upstream_id ?? null,
+      // 编辑时不可自定义（换 token 等于换一把密钥，已有客户端会立刻失效）
+      customToken: '',
     });
     setUnknownModels(null);
     setFormOpen(true);
@@ -262,6 +287,7 @@ export default function KeysPage() {
         models: toLines(form.models),
         quota: Number(form.quota) || 0,
         quota_credit: Number(form.quotaCredit) || 0,
+        daily_quota: Math.max(0, Math.floor(Number(form.dailyQuota) || 0)),
         // '' 是有意义的取值（不限制版本），必须照传——后端以它区分
         // 「存量密钥，两版都能调」与「限定了某一版」
         //
@@ -275,6 +301,10 @@ export default function KeysPage() {
         // 后端以它区分「显式改回默认上游」与「本次没提交该字段」（PATCH 语义）。
         upstream_id: form.upstream_id,
       };
+      // 只在新建设置：编辑不提交该字段（后端也没有对应 PATCH 语义）
+      if (!editing && form.customToken.trim()) {
+        payload.custom_token = form.customToken.trim();
+      }
 
       // 新建：填了天数才设过期（0 = 永不过期，不下发 expires_at）
       // 编辑：按显式选择处理，避免「打开就保存」把有效期重置
@@ -328,6 +358,36 @@ export default function KeysPage() {
       reload();
     } catch (e) {
       notify.err(errText(e));
+    }
+  }
+
+  /**
+   * 「再复制一次」：向后端要一次明文，然后直接写进剪贴板。
+   *
+   * 为什么点一下就是复制、而不是先开弹窗：用户来这一行就是为了复制（密钥本身
+   * 贴进客户端配置），多一次点击没有意义。`copyText` 在非安全上下文里会退回
+   * `execCommand('copy')`；两条路都不行时（浏览器拦了）才把密钥显示出来让他手动
+   * 选中复制 —— 静默失败只会变成「点了没反应」。
+   *
+   * 取不回来（存量密钥，库里只有哈希）时后端回 409 且说明该怎么办，
+   * 这里原样弹给他，不再自己编一句。
+   */
+  async function copyKey(k: ApiKey) {
+    if (revealing !== null) return;
+    setRevealing(k.id);
+    try {
+      const r = await keyApi.reveal(k.id);
+      if (await copyText(r.key)) {
+        notify.ok(t('keys.keyCopied'), r.name || k.name);
+        setCopiedId(k.id);
+        window.setTimeout(() => setCopiedId(null), 1500);
+      } else {
+        setRevealed({name: r.name || k.name, key: r.key});
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setRevealing(null);
     }
   }
 
@@ -597,7 +657,8 @@ export default function KeysPage() {
               // 否则会出现「列表显示正常、调用却被 429」，用户会以为是网关坏了。
               const overQuota =
                 (!!k.quota && k.used_tokens >= k.quota) ||
-                (!!k.quota_credit && k.used_credit >= k.quota_credit);
+                (!!k.quota_credit && k.used_credit >= k.quota_credit) ||
+                (!!k.daily_quota && (k.daily_used_tokens ?? 0) >= k.daily_quota);
               return (
                 <TableRow key={k.id} className="border-b border-border/40">
                   <TableCell className="pl-4 text-sm font-medium">
@@ -676,6 +737,23 @@ export default function KeysPage() {
                             {fmtNumber(k.used_tokens)}
                             {k.quota ? ` / ${fmtNumber(k.quota)}` : ''}
                           </span>
+                          {!!k.daily_quota && (() => {
+                            const dUsed = k.daily_used_tokens ?? 0;
+                            const dRatio = dUsed / k.daily_quota;
+                            const dTone = dRatio >= 1
+                              ? 'text-red-600 dark:text-red-400 font-medium'
+                              : dRatio >= 0.8
+                                ? 'text-amber-600 dark:text-amber-400 font-medium'
+                                : 'text-muted-foreground';
+                            return (
+                              <span className={`text-[10px] ${dTone}`} title={t('keys.quotaDaily')}>
+                                {t('keys.dailyUsed', {
+                                  used: fmtNumber(dUsed),
+                                  quota: fmtNumber(k.daily_quota),
+                                })}
+                              </span>
+                            );
+                          })()}
                           {!!k.quota_credit && (
                             <span
                               className={`text-[10px] ${cTone}`}
@@ -701,6 +779,23 @@ export default function KeysPage() {
                   {isAdmin && (
                     <TableCell className="pr-4">
                       <div className="flex justify-end gap-1">
+                        {/* 「复制密钥」：明文不随列表下发，点这里才向后端要
+                            （会话管理员 + 审计）。存量密钥取不回来时后端会说明原因。 */}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 rounded-md"
+                          title={t('keys.copyKey')}
+                          aria-label={t('keys.copyKey')}
+                          disabled={revealing !== null}
+                          onClick={() => void copyKey(k)}
+                        >
+                          {revealing === k.id
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : copiedId === k.id
+                              ? <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                              : <Copy className="h-3.5 w-3.5" />}
+                        </Button>
                         <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('keys.edit')} onClick={() => openEdit(k)}>
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -855,6 +950,20 @@ export default function KeysPage() {
                   />
                 </div>
                 <div className="space-y-1.5">
+                  {/* 每日 token 限额：与总额度各自独立，按服务器本地日期每天 0 点恢复 */}
+                  <Label className="text-[11px] text-muted-foreground">{t('keys.quotaDaily')}</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={form.dailyQuota}
+                    onChange={(e) => setForm({...form, dailyQuota: e.target.value})}
+                  />
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t('keys.quotaDailyHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
                   {/* 积分额度：与 token 额度各自独立，任一超限即拒绝，两个都留 0 = 不限。
                       step=any 是必要的——上游按倍率扣费，值本身可能是小数（如 0.05），
                       限成整数会让小额预算根本没法设。 */}
@@ -981,6 +1090,25 @@ export default function KeysPage() {
                   {t('keys.upstreamHint')}
                 </p>
               </div>
+              {/* 密钥形态（issue #447）：只在新建时出现 —— 创建后换 token 等于换
+                  一把密钥，已有客户端的配置会立刻失效，不该提供入口。
+                  不填 = 默认 wbk_ 随机串；填了需要部署开启 WB_KEY_CUSTOM_ENABLED，
+                  否则后端 403 并在提示里说明要设哪个环境变量。 */}
+              {!editing && (
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">
+                    {t('keys.customTokenLabel')}
+                  </Label>
+                  <Input
+                    value={form.customToken}
+                    placeholder={t('keys.customTokenPlaceholder')}
+                    onChange={(e) => setForm({...form, customToken: e.target.value})}
+                  />
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t('keys.customTokenHint')}
+                  </p>
+                </div>
+              )}
               <div className="space-y-1.5">
                 <Label className="text-[11px] text-muted-foreground">{t('keys.modelWhitelist')}</Label>
                 {/* 手输保留（清单里暂时没有的模型仍要能填），旁边给「从清单选择」：
@@ -1207,6 +1335,32 @@ export default function KeysPage() {
           </DialogBody>
           <DialogFooter>
             <Button className="rounded-full" onClick={() => { setIssued(null); setExported(null); }}>
+              {t('keys.savedIt')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 再复制一次：查看已创建密钥的明文（管理员 + 审计） */}
+      <Dialog open={!!revealed} onOpenChange={(v) => { if (!v) setRevealed(null); }}>
+        <DialogContent className="w-[min(560px,calc(100vw-2rem))] max-w-[min(560px,calc(100vw-2rem))] sm:max-w-[min(560px,calc(100vw-2rem))]">
+          <DialogHeader>
+            <DialogTitle>{t('keys.revealTitle')}</DialogTitle>
+            <DialogDescription>{t('keys.revealDesc')}</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <div className="space-y-3 px-6 pb-3">
+              {/* 名称单独一行：密钥可能叫「客服组-夜班」，与密钥本身一样长时会挤在一起 */}
+              <p className="break-all text-sm font-medium">{revealed?.name}</p>
+              {/* min-w-0 不能少：flex 项默认 min-width:auto，长密钥会把复制按钮挤出去 */}
+              <div className="flex items-center gap-2 rounded-2xl bg-muted p-3">
+                <code className="min-w-0 flex-1 break-all font-mono text-xs">{revealed?.key}</code>
+                <CopyButton value={revealed?.key || ''} size="sm" showLabel label={t('keys.copyKey')} />
+              </div>
+            </div>
+          </DialogBody>
+          <DialogFooter>
+            <Button className="rounded-full" onClick={() => setRevealed(null)}>
               {t('keys.savedIt')}
             </Button>
           </DialogFooter>
